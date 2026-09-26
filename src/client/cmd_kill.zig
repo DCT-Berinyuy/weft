@@ -87,7 +87,7 @@ pub fn run(
         });
     }
 
-    const remotes = inst.get_remotes(alloc, io, term) catch &.{};
+    const remotes = inst.get_remotes_leaky(alloc, io, term) catch &.{};
     var total_killed: u32 = 0;
 
     if (steps_to_kill.items.len == 0) {

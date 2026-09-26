@@ -5,7 +5,6 @@ const cmd_check = @import("client/cmd_check.zig");
 const cmd_follow = @import("client/cmd_follow.zig");
 const cmd_gc = @import("client/cmd_gc.zig");
 const cmd_kill = @import("client/cmd_kill.zig");
-const cmd_list = @import("client/cmd_list.zig");
 const cmd_monitor = @import("client/cmd_monitor.zig");
 const cmd_remote = @import("client/cmd_remote.zig");
 const Deployment = @import("client/Deployment.zig");
@@ -54,18 +53,18 @@ const Argz = union(enum) {
 
     check: struct {
         pub const doc = "Validate project configuration, pipeline DAG, scripts, and environment";
-        pub const doc_env = "Target environment to validate (e.g. 'prod' loads .env overlaid by .env.prod; checks all if omitted)";
+        pub const doc_env = "Target extra environments to validate";
 
-        env: ?[]const u8 = null,
+        env: []const []const u8 = &.{},
     },
 
     do: struct {
         pub const doc = "Start a deployment";
         pub const doc_targets = "The different deployment targets";
-        pub const doc_env = "Environment to load (.env overlaid by .env.<name>)";
+        pub const doc_env = "Extra base environments";
 
         targets: []Step = &.{},
-        env: ?[]const u8 = null,
+        env: [][]const u8 = &.{},
     },
     retry: struct {
         pub const doc = "Retry an existing deployment";
@@ -73,11 +72,8 @@ const Argz = union(enum) {
 
         deployment: ?[]const u8 = null,
     },
-    list: struct {
-        pub const doc = "List recent deployments and their status";
-    },
     follow: struct {
-        pub const doc = "Follow a running task";
+        pub const doc = "Follow a running/completed tasks and output logs";
         pub const doc_pipeline = "The pipeline name to follow";
         pub const doc_deployment = "The deployment id to follow (defaults to latest)";
 
@@ -85,8 +81,8 @@ const Argz = union(enum) {
         deployment: ?[]const u8 = null,
     },
     monitor: struct {
-        pub const doc = "Monitor a remote or remote group";
-        pub const doc_spec = "The remote or remote group to follow. If ommited all remotes will be followed";
+        pub const doc = "Monitor a remote";
+        pub const doc_spec = "The remote to monitor. If ommited all remotes will be followed";
 
         spec: ?[]const u8 = null,
     },
@@ -148,7 +144,7 @@ const Argz = union(enum) {
     },
     help: argz.Help,
     nop: struct {
-        pub const hidden = true;
+        pub const doc = "nop";
     },
 };
 
@@ -198,7 +194,7 @@ pub fn main(init: std.process.Init) !void {
                 return daemon.run();
             },
             .token => {
-                const config = try DaemonInstall.read_config(init.io, gpa, &term);
+                const config = try DaemonInstall.read_config_leaky(init.io, gpa, &term);
                 term.println("{s}", .{config.secret});
                 std.zon.parse.free(gpa, config);
             },
@@ -232,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
             return cmd_do.run(gpa, init.io, &term, project, installation, .{
                 .start = .{
                     .targets = cmd.targets,
-                    .env = cmd.env,
+                    .extra_env = cmd.env,
                 },
             });
         },
@@ -254,13 +250,6 @@ pub fn main(init: std.process.Init) !void {
                 };
 
             return cmd_do.run(gpa, init.io, &term, project, installation, .{ .retry = resume_id });
-        },
-        .list => {
-            const project_dir = try std.Io.Dir.cwd().openDir(init.io, ".", .{});
-            defer project_dir.close(init.io);
-            const project = try Project.open(project_dir);
-
-            return cmd_list.run(gpa, init.io, &term, project);
         },
         .follow => |cmd| {
             const installation: ClientInstall = try .init(gpa, init.io, init.environ_map);

@@ -1,48 +1,45 @@
 const std = @import("std");
 
+const Server = @import("../daemon/Server.zig");
 pub const Connection = @import("../wire/Connection.zig");
 const Remote = @import("Remote.zig");
-const Server = @import("../daemon/Server.zig");
 
 conn: Connection,
-rw: struct { std.Io.net.Stream.Reader, std.Io.net.Stream.Writer },
-rw_buffers: struct { []u8, []u8 },
+reader: std.Io.net.Stream.Reader,
+writer: std.Io.net.Stream.Writer,
+buffer: []u8,
 stream: std.Io.net.Stream,
 
-fn init(self: *@This(), alloc: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream, secret: *const [32]u8) !void {
-    const reader_buf = try alloc.alloc(u8, 4 << 10);
-    errdefer alloc.free(reader_buf);
-    const writer_buf = try alloc.alloc(u8, 4 << 10);
-    errdefer alloc.free(writer_buf);
+fn create(gpa: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream, secret: *const [32]u8) !*@This() {
+    const self = try gpa.create(@This());
+    errdefer gpa.destroy(self);
+    const buffer = try gpa.alloc(u8, 8 << 10);
+    errdefer gpa.free(buffer);
 
     self.stream = stream;
-    self.rw_buffers = .{ reader_buf, writer_buf };
-    self.rw = .{ stream.reader(io, reader_buf), stream.writer(io, writer_buf) };
+    self.buffer = buffer;
+    self.reader = stream.reader(io, buffer[0 .. buffer.len / 2]);
+    self.writer = stream.writer(io, buffer[buffer.len / 2 ..]);
     self.conn = try Connection.init(
         io,
         secret,
-        &self.rw.@"0".interface,
-        &self.rw.@"1".interface,
+        &self.reader.interface,
+        &self.writer.interface,
     );
+    return self;
 }
 
-pub fn connect(alloc: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, secret: *const [32]u8) !*@This() {
+pub fn connect(gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, secret: *const [32]u8) !*@This() {
     const stream = try addr.connect(io, .{
         .mode = .stream,
         .protocol = .tcp,
     });
     errdefer stream.close(io);
-    const self = try alloc.create(@This());
-    errdefer alloc.destroy(self);
-
-    try self.init(alloc, io, stream, secret);
-    errdefer self.destroy(alloc, io);
-    return self;
+    return try create(gpa, io, stream, secret);
 }
 
 pub fn destroy(self: *@This(), alloc: std.mem.Allocator, io: std.Io) void {
     self.stream.close(io);
-    alloc.free(self.rw_buffers.@"0");
-    alloc.free(self.rw_buffers.@"1");
+    alloc.free(self.buffer);
     alloc.destroy(self);
 }

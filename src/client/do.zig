@@ -19,7 +19,7 @@ pub fn run(
     do: union(enum) {
         start: struct {
             targets: []const Step,
-            env: ?[]const u8 = null,
+            extra_env: [][]const u8 = &.{},
         },
         retry: Deployment.Id,
     },
@@ -32,13 +32,12 @@ pub fn run(
         .start => |start| blk: {
             const owned_targets = try alloc.dupe(Step, start.targets);
             const config = try project.get_config(alloc, term, io);
-            const deployment = try Deployment.create(io, config, owned_targets, start.env);
+            const deployment = try Deployment.init(io, config, owned_targets, start.extra_env);
             try deployment.save(alloc, io, project);
             break :blk deployment;
         },
         .retry => |id| blk: {
             var deployment = try project.load_deployment(alloc, io, id);
-            deployment.failed = &.{};
             if (project.get_config(alloc, term, io)) |config| {
                 deployment.config = config;
             } else |_| {}

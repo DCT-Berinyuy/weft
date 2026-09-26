@@ -36,15 +36,15 @@ pub const Artifact = struct {
 };
 
 project: *const Project,
-alloc: std.mem.Allocator,
+gpa: std.mem.Allocator,
 steps: std.ArrayList(Step),
 artifacts: std.ArrayList(Artifact),
 mutex: std.Io.Mutex = .init,
 
-pub fn init(alloc: std.mem.Allocator, project: *const Project) @This() {
+pub fn init(gpa: std.mem.Allocator, project: *const Project) @This() {
     return .{
         .project = project,
-        .alloc = alloc,
+        .gpa = gpa,
         .steps = .empty,
         .artifacts = .empty,
     };
@@ -52,22 +52,39 @@ pub fn init(alloc: std.mem.Allocator, project: *const Project) @This() {
 
 pub fn deinit(self: *@This()) void {
     for (self.artifacts.items) |a|
-        self.alloc.free(a.name);
-    self.artifacts.deinit(self.alloc);
-    self.steps.deinit(self.alloc);
+        self.gpa.free(a.name);
+    self.artifacts.deinit(self.gpa);
+    self.steps.deinit(self.gpa);
 }
 
 fn get_unlocked(self: *@This(), remote_name: []const u8, pipeline_name: []const u8) ?*Step {
-    for (self.steps.items) |*s|
-        if (std.mem.eql(u8, s.remote.get_name(), remote_name) and std.mem.eql(u8, s.pipeline.name, pipeline_name))
-            return s;
-
-    return null;
+    return for (self.steps.items) |*s| {
+        if (std.mem.eql(
+            u8,
+            s.remote.get_name(),
+            remote_name,
+        ) and
+            std.mem.eql(
+                u8,
+                s.pipeline.name,
+                pipeline_name,
+            ))
+            break s;
+    } else null;
 }
 
-fn artifact_unlocked(self: *@This(), name: []const u8, remote_name: []const u8) ?*Artifact {
+fn artifact_unlocked(self: *@This(), name: []const u8, remote: []const u8) ?*Artifact {
     for (self.artifacts.items) |*a|
-        if (std.mem.eql(u8, a.name, name) and std.mem.eql(u8, a.remote.get_name(), remote_name))
+        if (std.mem.eql(
+            u8,
+            a.name,
+            name,
+        ) and
+            std.mem.eql(
+                u8,
+                a.remote.get_name(),
+                remote,
+            ))
             return a;
 
     return null;
@@ -80,7 +97,7 @@ pub fn add(self: *@This(), io: std.Io, remote: *const Remote, pipeline: *const W
     if (self.get_unlocked(remote.get_name(), pipeline.name)) |s|
         return s;
 
-    try self.steps.append(self.alloc, .{
+    try self.steps.append(self.gpa, .{
         .remote = remote,
         .pipeline = pipeline,
         .status = .preparing,
@@ -170,8 +187,8 @@ pub fn artifact_progress(self: *@This(), io: std.Io, name: []const u8, remote: *
         a.status = status;
         a.percent = percent;
     } else {
-        try self.artifacts.append(self.alloc, .{
-            .name = try self.alloc.dupe(u8, name),
+        try self.artifacts.append(self.gpa, .{
+            .name = try self.gpa.dupe(u8, name),
             .remote = remote,
             .status = status,
             .percent = percent,

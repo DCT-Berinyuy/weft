@@ -8,16 +8,13 @@ const paths = @import("../domain/paths.zig");
 const proto = @import("../domain/proto.zig");
 const Term = @import("../domain/Term.zig");
 
-const client_config_size_limit: std.Io.Limit = .limited(10 << 10);
+const config_size_limit: std.Io.Limit = .limited(10 << 10);
 
 pub const Config = struct {
-    const Runner = struct {
-        user: ?[]const u8 = null,
-    };
+    runner_user: ?[]const u8 = null,
     secret: []const u8,
     port: u16 = 9338,
     max_workers: u32 = 8,
-    runner: Runner = .{},
 
     pub fn get_secret(self: @This()) ![32]u8 {
         var secret: [32]u8 = undefined;
@@ -70,23 +67,19 @@ pub fn open_temp(io: std.Io, sub: []const u8) !std.Io.Dir {
     return try sub_dir.createDirPathOpen(io, &uuid, .{});
 }
 
-pub fn install(io: std.Io, alloc: std.mem.Allocator, term: *Term, maybe_user: ?[]const u8) !void {
+pub fn install(io: std.Io, gpa: std.mem.Allocator, term: *Term, maybe_user: ?[]const u8) !void {
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, "/var/lib/weft/run");
-    try cwd.createDirPath(io, "/var/lib/weft/artifacts");
-    term.debug("created /var/lib/weft directory tree", .{});
 
     var child_stop = try std.process.spawn(io, .{
         .argv = &.{ "systemctl", "stop", "weftd.service" },
     });
     const stop_term = try child_stop.wait(io);
-    if (stop_term != .exited or stop_term.exited != 0) {
+    if (stop_term != .exited or stop_term.exited != 0)
         return error.SystemctlStopFailed;
-    }
 
     install_exe: {
-        const exe_path = try std.process.executablePathAlloc(io, alloc);
-        defer alloc.free(exe_path);
+        const exe_path = try std.process.executablePathAlloc(io, gpa);
+        defer gpa.free(exe_path);
 
         if (!std.mem.eql(u8, exe_path, "/usr/local/bin/weft")) {
             const bin_dir = try cwd.openDir(io, "/usr/local/bin", .{});
@@ -99,33 +92,33 @@ pub fn install(io: std.Io, alloc: std.mem.Allocator, term: *Term, maybe_user: ?[
     term.debug("installed binary to /usr/local/bin/weft", .{});
 
     write_config: {
-        const current_config: ?Config = read_config(io, alloc, null) catch null;
-        defer if (current_config) |c| std.zon.parse.free(alloc, c);
+        const current_config: ?Config = read_config_leaky(io, gpa, null) catch null;
+        defer if (current_config) |c|
+            std.zon.parse.free(gpa, c);
 
-        var secret: [32]u8 = undefined;
-        var secret_hex_buf: [64]u8 = undefined;
-        const secret_hex: []const u8 = if (current_config) |c|
-            c.secret
-        else blk: {
-            try io.randomSecure(&secret);
-            secret_hex_buf = std.fmt.bytesToHex(&secret, .lower);
-            break :blk &secret_hex_buf;
+        var secret_hex = secret_hex: {
+            var stack_secret: [64]u8 = undefined;
+            if (current_config) |c| {
+                @memcpy(&stack_secret, c.secret);
+                break :secret_hex stack_secret;
+            } else {
+                try io.randomSecure(stack_secret[0..32]);
+                break :secret_hex std.fmt.bytesToHex(stack_secret[0..32], .lower);
+            }
         };
 
         const runner_user = if (maybe_user) |u|
             u
         else if (current_config) |c|
-            c.runner.user
+            c.runner_user
         else
             null;
 
         const config = Config{
-            .secret = secret_hex,
+            .secret = &secret_hex,
             .port = if (current_config) |c| c.port else 9338,
             .max_workers = if (current_config) |c| c.max_workers else 8,
-            .runner = .{
-                .user = runner_user,
-            },
+            .runner_user = runner_user,
         };
 
         var config_file = try cwd.createFileAtomic(io, "/etc/weft.zon", .{
@@ -161,9 +154,8 @@ pub fn install(io: std.Io, alloc: std.mem.Allocator, term: *Term, maybe_user: ?[
             .argv = &.{ "systemctl", "enable", "--now", "weftd.service" },
         });
         const child_term = try child_en.wait(io);
-        if (child_term != .exited or child_term.exited != 0) {
+        if (child_term != .exited or child_term.exited != 0)
             return error.SystemctlEnableFailed;
-        }
 
         var child_restart = try std.process.spawn(io, .{
             .argv = &.{ "systemctl", "restart", "weftd.service" },
@@ -190,14 +182,14 @@ pub fn install(io: std.Io, alloc: std.mem.Allocator, term: *Term, maybe_user: ?[
     }
 }
 
-pub fn read_config(io: std.Io, alloc: std.mem.Allocator, term: ?*Term) !Config {
+pub fn read_config_leaky(io: std.Io, gpa: std.mem.Allocator, term: ?*Term) !Config {
     const cwd = std.Io.Dir.cwd();
 
     var file = cwd.openFile(io, "/etc/weft.zon", .{}) catch |err| {
         if (term) |t|
             if (err == error.AccessDenied)
                 t.err("cannot read /etc/weft.zon: permission denied (must be run as root)", .{})
-            else
+            else if (err == error.FileNotFound)
                 t.err("daemon configuration missing, run 'weft daemon install' first: {any}", .{err});
         return err;
     };
@@ -212,28 +204,19 @@ pub fn read_config(io: std.Io, alloc: std.mem.Allocator, term: ?*Term) !Config {
     }
     var buff: [4 << 10]u8 = undefined;
     var reader = file.reader(io, &buff);
-    const content = try reader.interface.allocRemaining(
-        alloc,
-        client_config_size_limit,
-    );
-    defer alloc.free(content);
-    const null_terminated = try alloc.dupeSentinel(
-        u8,
-        content,
+    const content: [:0]const u8 = try reader.interface.allocRemainingAlignedSentinel(
+        gpa,
+        config_size_limit,
+        .of(u8),
         0,
     );
-    defer alloc.free(null_terminated);
+    defer gpa.free(content);
 
     return try std.zon.parse.fromSliceAlloc(
         Config,
-        alloc,
-        null_terminated,
+        gpa,
+        content,
         null,
         .{},
     );
-}
-
-pub fn get_config(self: @This(), io: std.Io, alloc: std.mem.Allocator, term: ?*Term) !Config {
-    _ = self;
-    return read_config(io, alloc, term);
 }

@@ -339,26 +339,26 @@ fn handle_artifact_push(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: 
 }
 
 fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Connection) proto.Res(proto.task.spawn.Res) {
-    const ara = arena.allocator();
+    const alloc = arena.allocator();
     const gpa = daemon.gpa;
     const io = daemon.io;
 
-    const req = try conn.recv_object(ara, proto.task.spawn.Req);
+    const req = try conn.recv_object(alloc, proto.task.spawn.Req);
     const spec = req.spec;
 
-    const deployment = spec.task.deployment.to_string();
+    const task: Task = .{ .id = spec.task_id };
 
-    const task: Task = .{ .id = spec.task };
+    const deployment = task.id.deployment.to_string();
 
     const input_dirs = input_dirs: {
-        const input_dirs = try ara.alloc(
+        const input_dirs = try alloc.alloc(
             []const u8,
             spec.inputs.len,
         );
         for (spec.inputs, input_dirs) |input, *input_dir| {
             const path = try paths.artifact(
-                ara,
-                spec.task.workspace,
+                alloc,
+                spec.task_id.workspace,
                 &deployment,
                 input,
             );
@@ -367,40 +367,42 @@ fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Co
                 path,
                 .{},
             ) catch |err|
-                if (err == error.FileNotFound) {
+                if (err == error.FileNotFound)
                     return error.MissingInputArtifact;
-                };
+
             input_dir.* = path;
         }
         break :input_dirs input_dirs;
     };
 
-    const archive_dir_path = try task.archive(ara);
+    const archive_dir_path = try task.archive(alloc);
     try std.Io.Dir.cwd().createDirPath(daemon.io, archive_dir_path);
-    const log_path = try std.fs.path.join(ara, &.{ archive_dir_path, "log.txt" });
+    const log_path = try std.fs.path.join(alloc, &.{ archive_dir_path, "log.txt" });
+    var log_file: ?std.Io.File = try std.Io.Dir.cwd().createFile(daemon.io, log_path, .{ .truncate = false });
+    errdefer if (log_file) |f|
+        f.close(io);
 
-    if (spec.pkgs.len > 0) {
-        var log_file = try std.Io.Dir.cwd().createFile(daemon.io, log_path, .{ .truncate = false });
-        defer log_file.close(io);
-
-        for (spec.pkgs) |basename| {
-            try log_file.writeStreamingAll(io, try std.fmt.allocPrint(ara, "[nix] fetching {s}...\n", .{basename}));
-            daemon.store.fetch(io, basename) catch |err| {
-                try log_file.writeStreamingAll(io, try std.fmt.allocPrint(ara, "[nix] failed to fetch {s}: {s}\n", .{ basename, @errorName(err) }));
-                return err;
-            };
-            try log_file.writeStreamingAll(io, try std.fmt.allocPrint(ara, "[nix] installed {s}\n", .{basename}));
-        }
+    // vehement leak, but it's just a few bytes
+    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] Installing packages\n", .{}));
+    for (spec.pkgs) |basename| {
+        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] intalling {s}...\n", .{basename}));
+        daemon.store.fetch(io, basename) catch |err| {
+            try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] failed to fetch {s}: {s}\n", .{ basename, @errorName(err) }));
+            return err;
+        };
+        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] installed {s}\n", .{basename}));
     }
+    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] done\n", .{}));
+    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] setting up environment\n", .{}));
 
-    const run_dir_path = try task.run_dir_path(ara);
+    const run_dir_path = try task.run_dir_path(alloc);
 
     try std.Io.Dir.cwd().createDirPath(daemon.io, run_dir_path);
 
-    const cwd_dir_path = try std.fs.path.join(ara, &.{ run_dir_path, "cwd" });
+    const cwd_dir_path = try std.fs.path.join(alloc, &.{ run_dir_path, "cwd" });
     try std.Io.Dir.cwd().createDirPath(daemon.io, cwd_dir_path);
 
-    const script_path = try std.fs.path.join(ara, &.{ run_dir_path, "bin" });
+    const script_path = try std.fs.path.join(alloc, &.{ run_dir_path, "bin" });
 
     {
         const script_file = try std.Io.Dir.cwd().createFile(daemon.io, script_path, .{
@@ -410,104 +412,107 @@ fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Co
         try script_file.writeStreamingAll(io, spec.script);
     }
 
-    const runner_user = daemon.config.runner.user orelse "weft-runner";
+    const runner_user = daemon.config.runner_user orelse "weft-runner";
+    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] running task as {s}\n", .{runner_user}));
     const is_default_runner = std.mem.eql(u8, runner_user, "weft-runner");
 
     const home_dir_path = if (is_default_runner)
-        try paths.home(ara, spec.task.workspace)
+        try paths.home(alloc, spec.task_id.workspace)
     else
-        try std.fmt.allocPrint(ara, "/home/{s}", .{runner_user});
+        try std.fmt.allocPrint(alloc, "/home/{s}", .{runner_user});
 
     if (is_default_runner)
         try std.Io.Dir.cwd().createDirPath(daemon.io, home_dir_path);
 
-    const output_dir_path = try std.fs.path.join(ara, &.{ run_dir_path, "out" });
+    const output_dir_path = try std.fs.path.join(alloc, &.{ run_dir_path, "out" });
 
-    var state_dirs: std.ArrayList([]const u8) = try .initCapacity(ara, spec.outputs.len + 2);
-    try state_dirs.append(ara, paths.state_dir(cwd_dir_path));
+    var state_dirs: std.ArrayList([]const u8) = try .initCapacity(alloc, spec.outputs.len + 2);
+    try state_dirs.append(alloc, paths.state_dir(cwd_dir_path));
     if (is_default_runner)
-        try state_dirs.append(ara, paths.state_dir(home_dir_path));
+        try state_dirs.append(alloc, paths.state_dir(home_dir_path));
 
     for (spec.outputs) |output| {
-        const path = try std.fs.path.join(ara, &.{
+        const path = try std.fs.path.join(alloc, &.{
             output_dir_path,
             output,
         });
         try std.Io.Dir.cwd().createDirPath(daemon.io, path);
-        try state_dirs.append(ara, paths.state_dir(path));
+        try state_dirs.append(alloc, paths.state_dir(path));
     }
-    const unit_name = try task.unit_name(ara);
+    const unit_name = try task.unit_name(alloc);
     var bind_paths: std.ArrayList([]const u8) = .empty;
     var bind_paths_read: std.ArrayList([]const u8) = .empty;
 
     if (spec.pkgs.len > 0) {
-        try bind_paths_read.append(ara, "/var/lib/weft/store:/nix/store");
-        try bind_paths_read.append(ara, "/var/lib/weft/store");
+        try bind_paths_read.append(alloc, "/var/lib/weft/store:/nix/store");
+        try bind_paths_read.append(alloc, "/var/lib/weft/store");
     }
 
     for (spec.keep) |keep| {
-        const cache_path = try task.keep_path(ara, keep.@"0");
+        const cache_path = try task.keep_path(alloc, keep.@"0");
         const mount_path = try std.fs.path.join(gpa, &.{ cwd_dir_path, keep.@"1" });
         defer gpa.free(mount_path);
 
         try std.Io.Dir.cwd().createDirPath(io, cache_path);
         try std.Io.Dir.cwd().createDirPath(io, mount_path);
-        try state_dirs.append(ara, paths.state_dir(cache_path));
+        try state_dirs.append(alloc, paths.state_dir(cache_path));
         try bind_paths.append(
-            ara,
-            try std.fmt.allocPrint(ara, "{s}:{s}", .{ cache_path, mount_path }),
+            alloc,
+            try std.fmt.allocPrint(alloc, "{s}:{s}", .{ cache_path, mount_path }),
         );
     }
 
     const env = bind_env: {
         var env: std.ArrayList([]const u8) = .empty;
         const input_dir = try paths.artifacts(
-            ara,
-            spec.task.workspace,
+            alloc,
+            spec.task_id.workspace,
             &deployment,
         );
-        try env.append(ara, try std.fmt.allocPrint(ara, "IN={s}", .{input_dir}));
-        try env.append(ara, try std.fmt.allocPrint(ara, "OUT={s}", .{output_dir_path}));
-        try env.append(ara, try std.mem.join(ara, "=", &.{ "HOME", home_dir_path }));
-        try env.append(ara, try std.mem.join(ara, "=", &.{ "USER", runner_user }));
-        try env.append(ara, try std.mem.join(ara, "=", &.{ "LOGNAME", runner_user }));
+        try env.append(alloc, try std.fmt.allocPrint(alloc, "IN={s}", .{input_dir}));
+        try env.append(alloc, try std.fmt.allocPrint(alloc, "OUT={s}", .{output_dir_path}));
+        try env.append(alloc, try std.mem.join(alloc, "=", &.{ "HOME", home_dir_path }));
+        try env.append(alloc, try std.mem.join(alloc, "=", &.{ "USER", runner_user }));
+        try env.append(alloc, try std.mem.join(alloc, "=", &.{ "LOGNAME", runner_user }));
 
         if (spec.pkgs.len > 0) {
             var pkg_bin_paths: std.ArrayList([]const u8) = .empty;
             for (spec.pkgs) |basename| {
-                const bin_dir = try std.fmt.allocPrint(ara, "/nix/store/{s}/bin", .{basename});
-                try pkg_bin_paths.append(ara, bin_dir);
+                const bin_dir = try std.fmt.allocPrint(alloc, "/nix/store/{s}/bin", .{basename});
+                try pkg_bin_paths.append(alloc, bin_dir);
             }
-            const joined_bins = try std.mem.join(ara, ":", pkg_bin_paths.items);
-            try env.append(ara, try std.fmt.allocPrint(ara, "PATH={s}:/usr/local/bin:/usr/bin:/bin", .{joined_bins}));
+            const joined_bins = try std.mem.join(alloc, ":", pkg_bin_paths.items);
+            try env.append(alloc, try std.fmt.allocPrint(alloc, "PATH={s}:/usr/local/bin:/usr/bin:/bin", .{joined_bins}));
         }
 
         for (spec.vars) |pair|
-            try env.append(ara, try std.mem.join(ara, "=", &.{ pair.@"0", pair.@"1" }));
+            try env.append(alloc, try std.mem.join(alloc, "=", &.{ pair.@"0", pair.@"1" }));
         break :bind_env env;
     };
+    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] handling sibling instances(second_instance = {any})\n", .{spec.second_instance}));
 
     switch (spec.second_instance) {
         .ignore => {},
         .kill => {
-            if (try task.is_active(gpa, io))
-                try task.kill(gpa, io);
-            var siblings = try task.siblings(gpa, daemon.io);
+            var siblings = try task.siblings(gpa, daemon.io, false);
             defer siblings.deinit(daemon.io);
             while (try siblings.next(io)) |sibling|
-                if (try sibling.is_active(gpa, io))
+                if (try sibling.is_active(gpa, io)) {
+                    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] killing sibling task from {s}\n", .{&sibling.id.deployment.to_string()}));
                     try sibling.kill(gpa, io);
+                };
         },
         .fail => {
-            if (try task.is_active(gpa, io))
-                return error.AlreadyRunning;
-            var siblings = try task.siblings(gpa, daemon.io);
+            var siblings = try task.siblings(gpa, daemon.io, false);
             defer siblings.deinit(daemon.io);
             while (try siblings.next(io)) |sibling|
-                if (try sibling.is_active(gpa, io))
+                if (try sibling.is_active(gpa, io)) {
+                    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] found sibling {s}; failing\n", .{&sibling.id.deployment.to_string()}));
                     return error.AlreadyRunning;
+                };
         },
     }
+    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] Spawning systemd-run for task {s} \n", .{unit_name}));
 
     var child = try systemd.run(
         gpa,
@@ -518,7 +523,7 @@ fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Co
             .raw = &.{},
             .unit = .{
                 .type = .exec,
-                .description = try std.fmt.allocPrint(ara, "Weft runner", .{}),
+                .description = try std.fmt.allocPrint(alloc, "Weft runner", .{}),
             },
             .fs = .{
                 .inaccessible = &.{},
@@ -537,8 +542,7 @@ fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Co
                 .private_devices = true,
                 .protect_kernel_modules = true,
                 .protect_kernel_tunables = true,
-                // .private_network = true,
-                // .restrict_address_families = &.{ "AF_UNIX", "AF_INET", "AF_INET6" },
+                .private_network = spec.tune.disable_network,
                 .no_new_privileges = true,
             },
             .run = .{
@@ -551,9 +555,9 @@ fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Co
                 .state_directories = state_dirs.items,
                 .env = env.items,
                 .hooks = .{
-                    .poststart = try std.fmt.allocPrint(ara, "+/usr/bin/touch {s}/started", .{run_dir_path}),
+                    .poststart = try std.fmt.allocPrint(alloc, "+/usr/bin/touch {s}/started", .{run_dir_path}),
                     .poststop = try std.fmt.allocPrint(
-                        ara,
+                        alloc,
                         "+/usr/local/bin/weft daemon ipc completed {s} $EXIT_STATUS",
                         .{unit_name},
                     ),
@@ -562,16 +566,17 @@ fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Co
                 .stdout = .{ .append = log_path },
             },
             .resources = .{
-                .memory_max = spec.memory_max,
-                .memory_high = spec.memory_high,
-                .cpu_quota = spec.cpu_quota,
-                .tasks_max = spec.tasks_max,
-                .io_weight = spec.io_weight,
-                .timeout = spec.timeout,
+                .memory_max = spec.tune.memory_max,
+                .memory_high = spec.tune.memory_high,
+                .cpu_quota = spec.tune.cpu_quota,
+                .tasks_max = spec.tune.tasks_max,
+                .io_weight = spec.tune.io_weight,
+                .timeout = spec.tune.timeout,
             },
         },
     );
     const term = try child.wait(daemon.io);
+    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] exited with: {any} \n", .{term}));
     if (term.exited != 0) {
         daemon.term.err("Systemd task launch failed: {any}", .{term});
         return error.SpawnFailed;

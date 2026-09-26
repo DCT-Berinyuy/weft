@@ -124,7 +124,7 @@ pub fn run(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const remotes = try inst.get_remotes(alloc, io, term);
+    const remotes = try inst.get_remotes_leaky(alloc, io, term);
     if (remotes.len == 0) {
         term.err("no remotes configured. Run 'weft remote install' first.", .{});
         return error.NoRemotes;

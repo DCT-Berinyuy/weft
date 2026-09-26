@@ -23,7 +23,7 @@ pub fn run_deployment(
     inst: ClientInstall,
     deployment: *Deployment,
 ) !void {
-    const remotes = try inst.get_remotes(gpa, io, term);
+    const remotes = try inst.get_remotes_leaky(gpa, io, term);
     defer gpa.free(remotes);
 
     var state: DeploymentState = .init(gpa, &project);
@@ -148,19 +148,13 @@ pub fn run_deployment(
                             );
                         }
 
-                        const step: Deployment.Step = .{
-                            .remote = remote_name,
-                            .pipeline = pipeline_name,
-                        };
-
                         switch (item.status) {
                             .running => {},
                             .success => {
                                 deployment.remove_running(gpa, remote_name, pipeline_name);
                                 const pipeline = deployment.config.get_pipeline(pipeline_name);
                                 if (pipeline) |p| {
-                                    var out_buf: [1][]const u8 = undefined;
-                                    for (p.outputs(&out_buf)) |output| {
+                                    for (p.out orelse &.{p.name}) |output| {
                                         try deployment.add_artifact(gpa, .{
                                             .remote = remote_name,
                                             .pipeline = pipeline_name,
@@ -175,14 +169,12 @@ pub fn run_deployment(
                             },
                             .failed => |code| {
                                 deployment.remove_running(gpa, remote_name, pipeline_name);
-                                deployment.add_failed(gpa, step) catch {};
                                 const err_msg = try std.fmt.allocPrint(gpa, "task failed with exit code {d}", .{code});
                                 state.err(io, remote_name, pipeline_name, err_msg);
                                 deployment.save(gpa, io, project) catch {};
                             },
                             .not_found => {
                                 deployment.remove_running(gpa, remote_name, pipeline_name);
-                                deployment.add_failed(gpa, step) catch {};
                                 state.err(io, remote_name, pipeline_name, "task not found on remote");
                                 deployment.save(gpa, io, project) catch {};
                             },
@@ -218,7 +210,6 @@ pub fn spawn_step(
 ) !void {
     errdefer if (depl.lock(io)) |_| {
         dep.remove_running(gpa, step.remote, step.pipeline);
-        dep.add_failed(gpa, step) catch {};
         state.err(io, step.remote, step.pipeline, "failed to spawn task");
         dep.save(gpa, io, project) catch {};
         depl.unlock(io);
@@ -229,8 +220,7 @@ pub fn spawn_step(
             try depl.lock(io);
             defer depl.unlock(io);
 
-            var out_buf: [1][]const u8 = undefined;
-            for (pipeline.outputs(&out_buf)) |output| {
+            for (pipeline.out orelse &.{pipeline.name}) |output| {
                 try dep.add_artifact(gpa, .{
                     .remote = step.remote,
                     .pipeline = step.pipeline,
@@ -291,7 +281,7 @@ pub fn spawn_step(
         pipeline,
         dep.id,
         project.dir,
-        dep.env,
+        dep.extra_env,
         env_map,
         script_content,
     );
@@ -321,7 +311,6 @@ pub fn spawn_step(
             try depl.lock(io);
             defer depl.unlock(io);
             dep.remove_running(gpa, step.remote, step.pipeline);
-            dep.add_failed(gpa, step) catch {};
             state.err(io, step.remote, step.pipeline, @errorName(err));
             dep.save(gpa, io, project) catch {};
             return;
@@ -333,7 +322,6 @@ pub fn spawn_step(
             try depl.lock(io);
             defer depl.unlock(io);
             dep.remove_running(gpa, step.remote, step.pipeline);
-            dep.add_failed(gpa, step) catch {};
             const msg = if (err == error.AlreadyRunning)
                 "task already running on remote"
             else

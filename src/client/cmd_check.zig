@@ -1,11 +1,11 @@
 const std = @import("std");
 
+const Task = @import("../daemon/Task.zig");
 const Term = @import("../domain/Term.zig");
 const Weft = @import("../domain/Weft.zig");
 const ClientInstall = @import("ClientInstall.zig");
 const Deployment = @import("Deployment.zig");
 const Project = @import("Project.zig");
-const Task = @import("../daemon/Task.zig");
 
 fn check_cycle(
     alloc: std.mem.Allocator,
@@ -24,7 +24,7 @@ fn check_cycle(
         return false;
     defer _ = stack.pop();
 
-    for (pipeline.inputs()) |input|
+    for (pipeline.in) |input|
         if (Weft.is_source_artifact(input))
             continue
         else for (config.pipelines) |other|
@@ -41,7 +41,7 @@ pub fn run(
     term: *Term,
     project: Project,
     inst: ClientInstall,
-    env_name: ?[]const u8,
+    extra_envs: []const []const u8,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -66,7 +66,7 @@ pub fn run(
     defer cycle_stack.deinit(alloc);
 
     for (config.pipelines) |pipeline| {
-        for (pipeline.inputs()) |input| {
+        for (pipeline.in) |input| {
             if (Weft.is_source_artifact(input)) {
                 if (std.mem.startsWith(u8, input, "src.")) {
                     const req_src = input["src.".len..];
@@ -142,7 +142,7 @@ pub fn run(
             },
         };
 
-    if (env_name) |target| {
+    for (extra_envs) |target| {
         if (config.get_environment(target) == null) {
             term.err("environment '{s}' not found in weft.zon", .{target});
             return error.ValidationFailed;
@@ -160,7 +160,7 @@ pub fn run(
             pipeline,
             dummy_dep_id,
             project.dir,
-            env_name,
+            extra_envs,
             inst.env,
             "",
         ) catch |err| {

@@ -16,6 +16,7 @@ const Task = @import("Task.zig");
 
 io: std.Io,
 gpa: std.mem.Allocator,
+arena: std.heap.ArenaAllocator,
 install: DaemonInstall,
 server: Server,
 config: DaemonInstall.Config,
@@ -31,8 +32,11 @@ pub fn deinit(self: *@This()) void {
     std.zon.parse.free(self.gpa, self.config);
     self.store.deinit();
 }
-pub fn init(alloc: std.mem.Allocator, io: std.Io, install: DaemonInstall, term: *Term) !@This() {
-    const config = try install.get_config(io, alloc, term);
+pub fn init(gpa: std.mem.Allocator, io: std.Io, install: DaemonInstall, term: *Term) !@This() {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+    const config = try DaemonInstall.read_config_leaky(io, alloc, term);
 
     var server = try Server.init(
         io,
@@ -41,15 +45,16 @@ pub fn init(alloc: std.mem.Allocator, io: std.Io, install: DaemonInstall, term: 
     );
     errdefer server.deinit(io);
     return .{
-        .gpa = alloc,
+        .gpa = gpa,
+        .arena = arena,
         .io = io,
         .install = install,
         .config = config,
         .server = server,
         .term = term,
-        .pressor = try .init(alloc, io),
-        .stats_server = try .init(alloc, io, term),
-        .store = Store.init(alloc, term),
+        .pressor = try .init(gpa, io),
+        .stats_server = try .init(gpa, io, term),
+        .store = Store.init(gpa, term),
     };
 }
 

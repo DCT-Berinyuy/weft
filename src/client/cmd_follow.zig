@@ -40,7 +40,7 @@ pub fn run(
         return err;
     };
 
-    const remotes = try inst.get_remotes(alloc, io, term);
+    const remotes = try inst.get_remotes_leaky(alloc, io, term);
 
     const pipeline_name = if (pipeline_spec.len > 0 and pipeline_spec[0] == '.')
         pipeline_spec[1..]

@@ -25,7 +25,7 @@ pub fn run(
     const alloc = arena.allocator();
 
     const older_than_ms = if (older_than_str) |s| gc_core.parse_duration(s) else null;
-    const remotes = inst.get_remotes(alloc, io, term) catch &.{};
+    const remotes = inst.get_remotes_leaky(alloc, io, term) catch &.{};
 
     var workspace: ?[]const u8 = null;
     if (project) |prj| {

@@ -2,18 +2,18 @@ const std = @import("std");
 
 const Term = @import("../domain/Term.zig");
 const Weft = @import("../domain/Weft.zig");
+pub const Id = @import("DeploymentId.zig");
 const Project = @import("Project.zig");
 pub const Step = @import("Step.zig");
 
 id: Id,
 
 config: Weft,
-env: ?[]const u8 = null,
+extra_env: [][]const u8 = &.{},
 artifacts: []Artifact = &.{},
 sources: [][]const u8 = &.{},
 running: []Step = &.{},
 targets: []Step = &.{},
-failed: []Step = &.{},
 
 pub const Artifact = struct {
     remote: []const u8,
@@ -21,89 +21,49 @@ pub const Artifact = struct {
     name: []const u8,
 };
 
-pub const Id = struct {
-    const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    const epoch_ms: u64 = 1_767_225_600_000;
+pub fn get_artifact(self: @This(), output: []const u8) ?Artifact {
+    return for (self.artifacts) |art| {
+        if (std.mem.eql(u8, output, art.name))
+            break art;
+    } else null;
+}
 
-    const decode_table: [128]u8 = blk: {
-        var table: [128]u8 = [_]u8{255} ** 128;
-        for (alphabet, 0..) |c, idx|
-            table[c] = @intCast(idx);
+/// This function will be removed
+pub fn get_pipeline_artifact(self: @This(), pipeline: ?[]const u8, output: ?[]const u8) ?Artifact {
+    return for (self.artifacts) |art| {
+        if (pipeline) |p|
+            if (std.mem.eql(u8, p, art.pipeline))
+                if (output) |o|
+                    if (std.mem.eql(u8, art.name, o))
+                        break art
+                    else
+                        continue
+                else
+                    break art
+            else {}
+        else if (output) |o|
+            if (std.mem.eql(u8, o, art.name))
+                break art
+            else {};
+    } else null;
+}
 
-        break :blk table;
-    };
-
-    raw: u64,
-
-    pub fn now(io: std.Io) !@This() {
-        const wall_ms = @as(u64, @intCast(std.Io.Clock.now(.real, io).toMilliseconds()));
-        const ms_since_epoch = if (wall_ms > epoch_ms) wall_ms - epoch_ms else 0;
-        const ticks = ms_since_epoch / 100;
-        var salt: [2]u8 = undefined;
-        try io.randomSecure(&salt);
-        const salt_u15: u64 = std.mem.readInt(u16, &salt, .little) & 0x7FFF;
-
-        return .{
-            .raw = (ticks << 15) | salt_u15,
-        };
-    }
-
-    pub fn to_string(self: @This()) [8]u8 {
-        var buf: [8]u8 = undefined;
-        var v = self.raw;
-        var i: usize = 8;
-        while (i > 0) {
-            i -= 1;
-            buf[i] = alphabet[@as(usize, @intCast(v % alphabet.len))];
-            v /= alphabet.len;
-        }
-        return buf;
-    }
-
-    pub fn parse(str: []const u8) !@This() {
-        if (str.len != 8)
-            return error.InvalidLength;
-        var val: u64 = 0;
-        for (str) |c| {
-            if (c >= 128)
-                return error.InvalidCharacter;
-            const digit = decode_table[c];
-            if (digit == 255)
-                return error.InvalidCharacter;
-            val = val * alphabet.len + digit;
-        }
-        return .{ .raw = val };
-    }
-
-    pub fn format(self: @This(), writer: *std.Io.Writer) !void {
-        const str = self.to_string();
-        try writer.writeAll(&str);
-    }
-
-    pub fn formatNumber(self: @This(), writer: *std.Io.Writer, num: std.fmt.Number) !void {
-        _ = num;
-        return self.format(writer);
-    }
-};
-
-pub fn next_target(self: @This()) ?*const Step {
-    target: for (self.targets) |*target| {
-        for (self.artifacts) |artifact|
-            if (std.mem.eql(u8, artifact.pipeline, target.pipeline) and std.mem.eql(u8, artifact.remote, target.remote))
-                continue :target;
-        return target;
-    }
-    return null;
+pub fn next_target(self: @This()) ?Step {
+    return for (self.targets) |target| {
+        if (self.get_pipeline_artifact(target.pipeline, null)) |_|
+            continue
+        else
+            break target;
+    } else null;
 }
 
 pub fn next_step(self: @This(), term: *Term) !?Step {
     target: for (self.targets) |*target| {
-        for (self.artifacts) |artifact|
-            if (std.mem.eql(u8, artifact.pipeline, target.pipeline) and std.mem.eql(u8, artifact.remote, target.remote))
-                continue :target;
+        if (self.get_pipeline_artifact(target.pipeline, null)) |_|
+            continue :target;
 
         return switch (try self.resolve_pipeline(term, target.pipeline, 0)) {
-            .waits, .running, .failed => continue :target,
+            .waits, .running => continue :target,
             .needs => |n| .{
                 .remote = target.remote,
                 .pipeline = n,
@@ -121,7 +81,6 @@ pub const StepStatus = union(enum) {
     done,
     running,
     runnable,
-    failed,
 };
 
 const resolve_pipeline_max_depth: u16 = 100;
@@ -129,63 +88,44 @@ const resolve_pipeline_max_depth: u16 = 100;
 pub fn resolve_pipeline(self: @This(), term: *Term, pipeline_name: []const u8, depth: u16) !StepStatus {
     if (depth >= resolve_pipeline_max_depth)
         return error.CyclicPipeline;
-    if (self.config.get_pipeline(pipeline_name)) |pipeline| {
-        var out_buf: [1][]const u8 = undefined;
-        const outs = pipeline.outputs(&out_buf);
-        for (outs) |output|
-            if (self.get_artifact(output)) |_|
-                return .done;
-        if (outs.len == 0)
-            for (self.artifacts) |art|
-                if (std.mem.eql(u8, art.pipeline, pipeline_name))
-                    return .done;
-        if (self.get_failed_step(pipeline.name)) |_|
-            return .failed;
-        if (self.get_running_step(pipeline.name)) |_|
-            return .running;
+    const pipeline = self.config.get_pipeline(pipeline_name) orelse return error.InvalidPipeline;
+    const outs: []const []const u8 = pipeline.out orelse &.{pipeline.name};
+    for (outs) |output|
+        if (self.get_artifact(output)) |_|
+            return .done;
+    if (self.get_running_step(pipeline.name)) |_|
+        return .running;
 
-        var waiting: ?[]const u8 = null;
-        var needs: ?[]const u8 = null;
-        var failed = false;
+    var waiting: ?[]const u8 = null;
+    var needs: ?[]const u8 = null;
 
-        input: for (pipeline.inputs()) |input| {
-            if (Weft.is_source_artifact(input))
-                continue :input;
-            other_pipeline: for (self.config.pipelines) |other_pipeline| {
-                if (std.mem.eql(u8, other_pipeline.name, pipeline.name))
-                    continue;
-                if (!other_pipeline.produces(input))
-                    continue :other_pipeline;
-                break :other_pipeline switch (try self.resolve_pipeline(
-                    term,
-                    other_pipeline.name,
-                    depth + 1,
-                )) {
-                    .done => continue :input,
-                    .failed => {
-                        failed = true;
-                        continue :input;
-                    },
-                    .running => waiting = other_pipeline.name,
-                    .waits => |task| waiting = task,
-                    .needs => |task| needs = task,
-                    .runnable => needs = other_pipeline.name,
-                };
-            } else {
-                term.err("Pipeline {s} has input {s} not provided by any other pipeline", .{ pipeline_name, input });
+    input: for (pipeline.in) |in| {
+        if (Weft.is_source_artifact(in))
+            continue :input;
+        const producer = self.config.get_producer(in) orelse {
+            term.err("Pipeline {s} has input {s} not provided by any other pipeline", .{ pipeline_name, in });
 
-                return error.InvalidInput;
-            }
+            return error.InvalidInput;
+        };
+        switch (try self.resolve_pipeline(
+            term,
+            producer.name,
+            depth + 1,
+        )) {
+            .done => continue :input,
+            .running => waiting = producer.name,
+            .waits => |task| waiting = task,
+            .needs => |task| needs = task,
+            .runnable => needs = producer.name,
         }
-        if (failed)
-            return .failed
-        else if (needs) |task|
-            return .{ .needs = task }
-        else if (waiting) |task|
-            return .{ .waits = task }
-        else
-            return .runnable;
-    } else return error.InvalidPipeline;
+    }
+
+    return if (needs) |task|
+        .{ .needs = task }
+    else if (waiting) |task|
+        .{ .waits = task }
+    else
+        .runnable;
 }
 pub fn get_running_step(self: @This(), pipeline: []const u8) ?*const Step {
     for (self.running) |*running|
@@ -194,18 +134,11 @@ pub fn get_running_step(self: @This(), pipeline: []const u8) ?*const Step {
     return null;
 }
 
-pub fn get_failed_step(self: @This(), pipeline: []const u8) ?*const Step {
-    for (self.failed) |*failed_step|
-        if (std.mem.eql(u8, failed_step.pipeline, pipeline))
-            return failed_step;
-    return null;
-}
-
 pub fn completed(self: @This()) bool {
     return self.next_target() == null;
 }
 
-pub fn create(io: std.Io, config: Weft, targets: []Step, env: ?[]const u8) !@This() {
+pub fn init(io: std.Io, config: Weft, targets: []Step, extra_env: [][]const u8) !@This() {
     const id = try Id.now(io);
     return .{
         .id = id,
@@ -213,16 +146,8 @@ pub fn create(io: std.Io, config: Weft, targets: []Step, env: ?[]const u8) !@Thi
         .artifacts = &.{},
         .running = &.{},
         .targets = targets,
-        .env = env,
+        .extra_env = extra_env,
     };
-}
-
-pub fn get_artifact(self: @This(), output: []const u8) ?*const Artifact {
-    for (self.artifacts) |*art|
-        if (std.mem.eql(u8, art.name, output))
-            return art;
-
-    return null;
 }
 
 pub fn add_running(self: *@This(), alloc: std.mem.Allocator, step: Step) !void {
@@ -231,27 +156,19 @@ pub fn add_running(self: *@This(), alloc: std.mem.Allocator, step: Step) !void {
 }
 
 pub fn remove_running(self: *@This(), alloc: std.mem.Allocator, remote: []const u8, pipeline: []const u8) void {
-    for (self.running, 0..) |s, idx| {
+    for (self.running, 0..) |s, idx|
         if (std.mem.eql(u8, s.remote, remote) and std.mem.eql(u8, s.pipeline, pipeline)) {
             self.running[idx] = self.running[self.running.len - 1];
             self.running = alloc.realloc(self.running, self.running.len - 1) catch self.running[0 .. self.running.len - 1];
             return;
-        }
-    }
+        };
 }
 
 pub fn add_artifact(self: *@This(), alloc: std.mem.Allocator, art: Artifact) !void {
     self.artifacts = try alloc.realloc(self.artifacts, self.artifacts.len + 1);
     self.artifacts[self.artifacts.len - 1] = art;
 }
-pub fn add_failed(self: *@This(), alloc: std.mem.Allocator, step: Step) !void {
-    for (self.failed) |f| {
-        if (std.mem.eql(u8, f.remote, step.remote) and std.mem.eql(u8, f.pipeline, step.pipeline))
-            return;
-    }
-    self.failed = try alloc.realloc(self.failed, self.failed.len + 1);
-    self.failed[self.failed.len - 1] = step;
-}
+
 pub fn add_source(self: *@This(), alloc: std.mem.Allocator, src: []const u8) !void {
     self.sources = try alloc.realloc(self.sources, self.sources.len + 1);
     self.sources[self.sources.len - 1] = try alloc.dupe(u8, src);

@@ -21,48 +21,39 @@ pub const Pipeline = struct {
         file: []const u8,
         nothing,
     };
+    pub const Tune = struct {
+        max_ram: ?u64 = null,
+        mem_lock: bool = false,
+        disable_network: bool = false,
+        oom_score_adjust: ?i32 = null,
+
+        memory_max: ?u64 = null,
+        memory_high: ?u64 = null,
+        cpu_quota: ?u16 = null,
+        tasks_max: ?u32 = null,
+        io_weight: ?u32 = null,
+        timeout: ?u32 = null,
+    };
 
     name: []const u8,
     in: []const Input = &.{},
     out: ?[]const Output = null,
     run: Run = .default,
-
-    //TODO
-    max_ram: ?u64 = null,
-    mem_lock: bool = false,
-    disable_network: bool = false,
-    oom_score_adjust: ?i32 = null,
-
-    memory_max: ?u64 = null,
-    memory_high: ?u64 = null,
-    cpu_quota: ?u16 = null,
-    tasks_max: ?u32 = null,
-    io_weight: ?u32 = null,
-    timeout: ?u32 = null,
+    tune: Tune,
 
     second_instance: SecondInstance = .ignore,
     keep: []Keep = &.{},
 
     uses: []const []const u8 = &.{},
 
-    pub fn inputs(self: @This()) []const []const u8 {
-        return self.in;
-    }
     pub fn produces(self: @This(), artifact: []const u8) bool {
-        if (self.out) |outs| {
+        return if (self.out) |outs|
             for (outs) |out| {
                 if (std.mem.eql(u8, out, artifact))
                     return true;
-            }
-            return false;
-        }
-        return std.mem.eql(u8, self.name, artifact);
-    }
-    pub fn outputs(self: *const @This(), buf: *[1][]const u8) []const []const u8 {
-        if (self.out) |o|
-            return o;
-        buf[0] = self.name;
-        return buf;
+            } else false
+        else
+            std.mem.eql(u8, self.name, artifact);
     }
 };
 
@@ -76,6 +67,13 @@ pub fn get_pipeline(self: @This(), name: []const u8) ?*const Pipeline {
     return for (self.pipelines) |*pipeline| {
         if (std.mem.eql(u8, pipeline.name, name))
             break pipeline;
+    } else null;
+}
+pub fn get_producer(self: @This(), output: []const u8) ?*const Pipeline {
+    return pipeline: for (self.pipelines) |*pipeline| {
+        for (pipeline.out orelse &.{pipeline.name}) |out|
+            if (std.mem.eql(u8, out, output))
+                break :pipeline pipeline;
     } else null;
 }
 pub inline fn get_sources(self: @This()) []const struct { []const u8, []const u8 } {

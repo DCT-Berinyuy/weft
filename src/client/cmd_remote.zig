@@ -67,26 +67,6 @@ fn resolve_host(alloc: std.mem.Allocator, io: std.Io, ssh_dest: []const u8, mayb
     return try alloc.dupe(u8, fallback_host);
 }
 
-fn extract_token(output: []const u8) ?[]const u8 {
-    var it = std.mem.splitBackwardsScalar(u8, output, '\n');
-    while (it.next()) |raw_line| {
-        var line = std.mem.trim(u8, raw_line, " \t\r");
-        if (std.mem.startsWith(u8, line, "secret: "))
-            line = std.mem.trim(u8, line["secret: ".len..], " \t\r");
-        if (line.len == 64) {
-            var all_hex = true;
-            for (line) |c|
-                if (!std.ascii.isHex(c)) {
-                    all_hex = false;
-                    break;
-                };
-            if (all_hex)
-                return line;
-        }
-    }
-    return null;
-}
-
 pub fn install(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -201,11 +181,12 @@ pub fn install(
         return error.RemoteInstallFailed;
     }
 
-    const token = extract_token(token_res.stdout) orelse {
-        term.err("could not extract daemon token from remote output:\n{s}", .{token_res.stdout});
-        return error.TokenNotFound;
-    };
-    const existing_remotes = try installation.get_remotes(alloc, io, term);
+    const token = std.mem.trim(u8, token_res.stdout, " \n");
+    if (token.len != 32) {
+        term.err("remote token fetch failed, could not parse token from output: '{s}'. ('{s}')", .{ token_res.stdout, token_res.stderr });
+        return error.RemoteInstallFailed;
+    }
+    const existing_remotes = try installation.get_remotes_leaky(alloc, io, term);
 
     var remotes_list: std.ArrayList(Remote) = .empty;
     var updated = false;
@@ -251,7 +232,7 @@ pub fn list(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const remotes = try installation.get_remotes(arena_alloc, io, term);
+    const remotes = try installation.get_remotes_leaky(arena_alloc, io, term);
     if (remotes.len == 0) {
         term.println("No remotes registered in remotes.zon", .{});
         return;
@@ -289,7 +270,7 @@ pub fn remove(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const remotes = try installation.get_remotes(arena_alloc, io, term);
+    const remotes = try installation.get_remotes_leaky(arena_alloc, io, term);
     var updated_list: std.ArrayList(Remote) = .empty;
     defer updated_list.deinit(arena_alloc);
 
