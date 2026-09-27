@@ -194,9 +194,8 @@ pub fn main(init: std.process.Init) !void {
                 return daemon.run();
             },
             .token => {
-                const config = try DaemonInstall.read_config_leaky(init.io, gpa, &term);
+                const config = try DaemonInstall.read_config_leaky(init.io, alloc, &term);
                 term.println("{s}", .{config.secret});
-                std.zon.parse.free(gpa, config);
             },
             .ipc => |i| switch (i) {
                 .completed => |msg| {

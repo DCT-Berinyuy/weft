@@ -70,6 +70,9 @@ pub fn open_temp(io: std.Io, sub: []const u8) !std.Io.Dir {
 pub fn install(io: std.Io, gpa: std.mem.Allocator, term: *Term, maybe_user: ?[]const u8) !void {
     const cwd = std.Io.Dir.cwd();
 
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    const alloc = arena.allocator();
+
     var child_stop = try std.process.spawn(io, .{
         .argv = &.{ "systemctl", "stop", "weftd.service" },
     });
@@ -92,7 +95,7 @@ pub fn install(io: std.Io, gpa: std.mem.Allocator, term: *Term, maybe_user: ?[]c
     term.debug("installed binary to /usr/local/bin/weft", .{});
 
     write_config: {
-        const current_config: ?Config = read_config_leaky(io, gpa, null) catch null;
+        const current_config: ?Config = read_config_leaky(io, alloc, null) catch null;
         defer if (current_config) |c|
             std.zon.parse.free(gpa, c);
 

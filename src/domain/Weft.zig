@@ -39,7 +39,7 @@ pub const Pipeline = struct {
     in: []const Input = &.{},
     out: ?[]const Output = null,
     run: Run = .default,
-    tune: Tune,
+    tune: Tune = .{},
 
     second_instance: SecondInstance = .ignore,
     keep: []Keep = &.{},
