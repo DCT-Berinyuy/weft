@@ -10,10 +10,14 @@ pub const Keep = struct {
 pub const Pipeline = struct {
     const Input = []const u8;
     const Output = []const u8;
-    pub const SecondInstance = union(enum) {
-        kill: void,
-        ignore: void,
-        fail: void,
+    pub const SecondInstance = struct {
+        then: union(enum) {
+            kill,
+            ignore,
+            fail,
+        } = .ignore,
+        wait: u32 = 0,
+        poll: u32 = 5,
     };
     pub const Run = union(enum) {
         default,
@@ -41,7 +45,7 @@ pub const Pipeline = struct {
     run: Run = .default,
     tune: Tune = .{},
 
-    second_instance: SecondInstance = .ignore,
+    sibling: SecondInstance = .{ .then = .ignore },
     keep: []Keep = &.{},
 
     uses: []const []const u8 = &.{},

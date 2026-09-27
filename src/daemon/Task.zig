@@ -280,7 +280,7 @@ pub const Spec = struct {
     inputs: []const []const u8 = &.{},
     outputs: []const []const u8 = &.{},
     keep: []const Weft.Keep = &.{},
-    second_instance: Weft.Pipeline.SecondInstance = .ignore,
+    sibling: Weft.Pipeline.SecondInstance = .ignore,
 
     tune: Tune,
     pub const resolve = Task.resolve;
@@ -401,7 +401,7 @@ pub fn resolve(
         .inputs = try gpa.dupe([]const u8, pipeline.in),
         .outputs = try gpa.dupe([]const u8, outputs),
         .keep = pipeline.keep,
-        .second_instance = pipeline.second_instance,
+        .sibling = pipeline.sibling,
         .tune = pipeline.tune,
     };
 }

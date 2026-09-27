@@ -77,7 +77,6 @@ pub fn run_client_server(self: *@This()) !void {
                 std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch {};
                 continue :req;
             };
-        self.term.info("new connection", .{});
 
         try spawn(self.io, &group, handler.handle, .{ self, &permits, stream });
     }

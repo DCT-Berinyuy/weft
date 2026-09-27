@@ -57,8 +57,6 @@ fn _run(daemon: *Daemon, stream: std.Io.net.Stream) !void {
                 err;
     };
 
-    daemon.term.info("Request: {any}", .{request});
-
     const response_buf = try gpa.alloc(u8, Connection.max_packet_size);
     defer gpa.free(response_buf);
     switch (request) {
@@ -489,31 +487,39 @@ fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Co
             try env.append(alloc, try std.mem.join(alloc, "=", &.{ pair.@"0", pair.@"1" }));
         break :bind_env env;
     };
-    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] handling sibling instances(second_instance = {any})\n", .{spec.second_instance}));
 
-    switch (spec.second_instance) {
-        .ignore => {},
-        .kill => {
-            var siblings = try task.siblings(gpa, daemon.io, false);
-            defer siblings.deinit(daemon.io);
-            while (try siblings.next(io)) |sibling|
-                if (try sibling.is_active(gpa, io)) {
-                    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] killing sibling task from {s}\n", .{&sibling.id.deployment.to_string()}));
-                    try sibling.kill(gpa, io);
-                };
-        },
-        .fail => {
-            var siblings = try task.siblings(gpa, daemon.io, false);
-            defer siblings.deinit(daemon.io);
-            while (try siblings.next(io)) |sibling|
-                if (try sibling.is_active(gpa, io)) {
-                    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] found sibling {s}; failing\n", .{&sibling.id.deployment.to_string()}));
-                    return error.AlreadyRunning;
-                };
-        },
+    handle_siblings: {
+        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] handling sibling instances(second_instance = {any})\n", .{spec.sibling}));
+
+        var waited: u32 = 0;
+
+        switch (spec.sibling) {
+            .ignore => {},
+            .kill => {
+                var siblings = try task.siblings(gpa, daemon.io, false);
+                defer siblings.deinit(daemon.io);
+                while (try siblings.next(io)) |sibling|
+                    if (try sibling.is_active(gpa, io)) {
+                        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] killing sibling task from {s}\n", .{&sibling.id.deployment.to_string()}));
+                        try sibling.kill(gpa, io);
+                    };
+            },
+            .fail => {
+                var siblings = try task.siblings(gpa, daemon.io, false);
+                defer siblings.deinit(daemon.io);
+                while (try siblings.next(io)) |sibling|
+                    if (try sibling.is_active(gpa, io)) {
+                        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] found sibling {s}; failing\n", .{&sibling.id.deployment.to_string()}));
+                        return error.AlreadyRunning;
+                    };
+            },
+        }
+        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] Spawning systemd-run for task {s} \n", .{unit_name}));
+        break :handle_siblings;
     }
-    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] Spawning systemd-run for task {s} \n", .{unit_name}));
 
+    log_file.?.close(io);
+    log_file = null;
     var child = try systemd.run(
         gpa,
         io,
