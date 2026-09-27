@@ -280,7 +280,7 @@ pub const Spec = struct {
     inputs: []const []const u8 = &.{},
     outputs: []const []const u8 = &.{},
     keep: []const Weft.Keep = &.{},
-    sibling: Weft.Pipeline.SecondInstance = .ignore,
+    sibling: Weft.Pipeline.SecondInstance = .{ .then = .ignore },
 
     tune: Tune,
     pub const resolve = Task.resolve;

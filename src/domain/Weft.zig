@@ -15,7 +15,7 @@ pub const Pipeline = struct {
             kill,
             ignore,
             fail,
-        } = .ignore,
+        },
         wait: u32 = 0,
         poll: u32 = 5,
     };

@@ -490,10 +490,26 @@ fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Co
 
     handle_siblings: {
         try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] handling sibling instances(second_instance = {any})\n", .{spec.sibling}));
+        const do_sibling = spec.sibling;
+        if (do_sibling.poll <= 0)
+            return error.InvalidSiblingConfig;
 
         var waited: u32 = 0;
+        while (waited < do_sibling.wait) : (waited += do_sibling.poll) {
+            var sibling_iter = try task.siblings(
+                gpa,
+                daemon.io,
+                false,
+            );
+            defer sibling_iter.deinit(daemon.io);
+            while (try sibling_iter.next(daemon.io)) |_|
+                break
+            else
+                break;
+            try std.Io.sleep(daemon.io, .fromSeconds(do_sibling.poll), .awake);
+        }
 
-        switch (spec.sibling) {
+        switch (spec.sibling.then) {
             .ignore => {},
             .kill => {
                 var siblings = try task.siblings(gpa, daemon.io, false);
