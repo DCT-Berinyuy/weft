@@ -3,6 +3,10 @@ const std = @import("std");
 const Deployment = @import("../client/Deployment.zig");
 const paths = @import("../domain/paths.zig");
 const proto = @import("../domain/proto.zig");
+const Term = @import("../domain/Term.zig");
+const Weft = @import("../domain/Weft.zig");
+pub const Database = Weft.Env.Database;
+const dotenv = @import("../util/dotenv.zig");
 const systemd = @import("../util/systemd.zig");
 
 const Task = @This();
@@ -94,22 +98,30 @@ pub const TaskSiblingsIterator = struct {
     task: *const Task,
     dir: ?std.Io.Dir,
     iter: ?std.Io.Dir.Iterator,
+    skip_self: bool,
 
     pub fn next(self: *@This(), io: std.Io) !?Task {
-        if (self.iter) |*iter| {
-            while (true) {
-                const task_deployment = self.task.id.deployment.to_string();
-                const entry = try iter.next(io) orelse return null;
+        const ignore_deployment = if (self.skip_self)
+            self.task.id.deployment.to_string()
+        else
+            null;
+        return if (self.iter) |*iter|
+            while (try iter.next(io)) |entry| {
                 if (entry.kind != .directory)
-                    continue;
-                if (std.mem.eql(u8, &task_deployment, entry.name))
-                    continue;
-                const dep_id = Deployment.Id.parse(entry.name) catch continue;
-                var sibling = self.task.*;
-                sibling.id.deployment = dep_id;
-                return sibling;
-            }
-        } else return null;
+                    continue
+                else if (ignore_deployment) |i|
+                    if (std.mem.eql(u8, entry.name, &i))
+                        continue
+                    else {}
+                else {
+                    const dep_id = Deployment.Id.parse(entry.name) catch continue;
+                    var sibling = self.task.*;
+                    sibling.id.deployment = dep_id;
+                    break sibling;
+                }
+            } else null
+        else
+            null;
     }
 
     pub fn deinit(self: *@This(), io: std.Io) void {
@@ -118,7 +130,7 @@ pub const TaskSiblingsIterator = struct {
     }
 };
 
-pub fn siblings(self: *const @This(), alloc: std.mem.Allocator, io: std.Io) !TaskSiblingsIterator {
+pub fn siblings(self: *const @This(), alloc: std.mem.Allocator, io: std.Io, skip_self: bool) !TaskSiblingsIterator {
     const run_dir = try self.run_dir_path(alloc);
     defer alloc.free(run_dir);
     const pipeline_dir = std.fs.path.dirname(run_dir).?;
@@ -128,6 +140,7 @@ pub fn siblings(self: *const @This(), alloc: std.mem.Allocator, io: std.Io) !Tas
                 .task = self,
                 .dir = null,
                 .iter = null,
+                .skip_self = skip_self,
             }
         else
             return err;
@@ -136,6 +149,7 @@ pub fn siblings(self: *const @This(), alloc: std.mem.Allocator, io: std.Io) !Tas
         .task = self,
         .dir = dir,
         .iter = dir.iterate(),
+        .skip_self = skip_self,
     };
 }
 
@@ -254,4 +268,140 @@ pub fn kill_matching(
         }
     }
     return killed_count;
+}
+
+pub const Spec = struct {
+    pub const Tune = Weft.Pipeline.Tune;
+    task_id: proto.task.Id,
+    script: []const u8,
+    vars: []const struct { []const u8, []const u8 } = &.{},
+    pkgs: []const []const u8 = &.{},
+    databases: []const Database = &.{},
+    inputs: []const []const u8 = &.{},
+    outputs: []const []const u8 = &.{},
+    keep: []const Weft.Keep = &.{},
+    sibling: Weft.Pipeline.SecondInstance = .{ .then = .ignore },
+
+    tune: Tune,
+    pub const resolve = Task.resolve;
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.vars);
+        alloc.free(self.pkgs);
+        alloc.free(self.databases);
+        alloc.free(self.inputs);
+        alloc.free(self.outputs);
+    }
+};
+
+pub fn resolve(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    term: *Term,
+    config: *const Weft,
+    pipeline: *const Weft.Pipeline,
+    deployment_id: Deployment.Id,
+    project_dir: ?std.Io.Dir,
+    extra_env: []const []const u8,
+    environ: ?*const std.process.Environ.Map,
+    script: []const u8,
+) !Spec {
+    if (script.len > 50 << 10) {
+        term.err("Large scripts/binaries shouldn't be imported as source artifacts", .{});
+        return error.ScriptTooLarge;
+    }
+    // Create a list where the first children environments are at the bottom, and the last
+    // parent environments are at the top.
+    const env_order: []const []const u8 = env_order: {
+        var env_order: std.ArrayList([]const u8) = .empty;
+        var todo: std.ArrayList([]const u8) = .empty;
+        defer {
+            todo.deinit(gpa);
+            env_order.deinit(gpa);
+        }
+        try todo.appendSlice(gpa, pipeline.uses);
+        try todo.appendSlice(gpa, extra_env);
+        std.mem.reverse([]const u8, todo.items);
+        todo: while (todo.pop()) |env_name| {
+            for (env_order.items) |item| {
+                if (std.mem.eql(u8, item, env_name))
+                    continue :todo;
+            } else try env_order.append(gpa, env_name);
+            const env = config.get_environment(env_name) orelse return error.InvalidEnvornment;
+            env_parent: for (env.uses) |env_parent|
+                for (env_order.items) |item| {
+                    if (std.mem.eql(u8, item, env_parent))
+                        continue :env_parent;
+                } else try env_order.append(gpa, env_parent);
+        }
+        std.mem.reverse([]const u8, env_order.items);
+        break :env_order try env_order.toOwnedSlice(gpa);
+    };
+    defer gpa.free(env_order);
+    var pkgs: std.ArrayList([]const u8) = .empty;
+    defer pkgs.deinit(gpa);
+    var env_vars: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env_vars.deinit(gpa);
+    {
+        for (env_order) |env_name| {
+            const env = config.get_environment(env_name).?;
+            for (env.pkgs) |pkg|
+                for (pkgs.items) |item| {
+                    if (std.mem.eql(u8, item, pkg))
+                        break;
+                } else try pkgs.append(gpa, pkg);
+            const env_dotenv = if (project_dir) |dir|
+                try dotenv.load_env(gpa, io, dir, env_name)
+            else
+                null;
+            for (env.vars) |env_var| {
+                const name = env_var.@"0";
+
+                if (env_var.@"1") |v|
+                    try env_vars.put(gpa, name, v)
+                else {
+                    if (environ) |env_map|
+                        if (env_map.get(name)) |val| {
+                            try env_vars.put(gpa, name, val);
+                            continue;
+                        };
+                    if (env_dotenv) |dot|
+                        if (dot.get(name)) |val| {
+                            try env_vars.put(gpa, name, val);
+                            continue;
+                        };
+                    return error.MissingEnviron;
+                }
+            }
+        }
+    }
+    const vars = try gpa.alloc(struct { []const u8, []const u8 }, env_vars.size);
+    errdefer gpa.free(vars);
+    var env_vars_iter = env_vars.iterator();
+    var idx: usize = 0;
+    while (env_vars_iter.next()) |entry| : (idx += 1) {
+        vars[idx].@"0" = entry.key_ptr.*;
+        vars[idx].@"1" = entry.value_ptr.*;
+    }
+
+    const outputs: []const []const u8 = if (pipeline.out) |o|
+        o
+    else
+        &.{pipeline.name};
+    return .{
+        .task_id = .{
+            .deployment = deployment_id,
+            .pipeline = pipeline.name,
+            .workspace = config.workspace,
+        },
+        .script = script,
+        .vars = vars,
+        .pkgs = try pkgs.toOwnedSlice(gpa),
+        .databases = &.{},
+        .inputs = try gpa.dupe([]const u8, pipeline.in),
+        .outputs = try gpa.dupe([]const u8, outputs),
+        .keep = pipeline.keep,
+        .sibling = pipeline.sibling,
+        .tune = pipeline.tune,
+    };
 }

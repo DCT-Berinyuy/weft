@@ -165,12 +165,12 @@ pub fn locate_script(self: @This(), gpa: std.mem.Allocator, io: std.Io, name: []
         else
             err;
     defer script_dir.close(io);
-    var walker = try std.Io.Dir.walkSelectively(script_dir, gpa);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if ((std.mem.startsWith(u8, entry.basename, script_with_dot) and
-            std.mem.countScalar(u8, entry.basename[script_with_dot.len..], '.') == 0) or
-            std.mem.eql(u8, entry.basename, name))
-            return try script_dir.realPathFileAlloc(io, entry.path, gpa);
+    var iter = script_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind == .file and
+            ((std.mem.startsWith(u8, entry.name, script_with_dot) and
+                std.mem.countScalar(u8, entry.name[script_with_dot.len..], '.') == 0) or
+                std.mem.eql(u8, entry.name, name)))
+            return try script_dir.realPathFileAlloc(io, entry.name, gpa);
     } else return null;
 }

@@ -1,8 +1,8 @@
 const std = @import("std");
 
+const Term = @import("../domain/Term.zig");
 const Deployment = @import("Deployment.zig");
 pub const Remote = @import("Remote.zig");
-const Term = @import("../domain/Term.zig");
 
 pub const read_only_user_permissions = @as(std.Io.File.Permissions, @enumFromInt(@as(u32, std.os.linux.S.IRUSR | std.os.linux.S.IWUSR)));
 pub const read_only_user_mode = read_only_user_permissions.toMode();
@@ -13,9 +13,9 @@ data_dir: std.Io.Dir,
 temp_dir: std.Io.Dir,
 env: *const std.process.Environ.Map,
 
-pub fn init(alloc: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !@This() {
-    const config_dir = try open_config_dir(alloc, io, env);
-    const data_dir = try open_data_dir(alloc, io, env);
+pub fn init(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !@This() {
+    const config_dir = try open_config_dir(gpa, io, env);
+    const data_dir = try open_data_dir(gpa, io, env);
 
     data_dir.createDirPath(io, "temp") catch {};
     const temp_dir = try data_dir.openDir(io, "temp", .{ .iterate = true });
@@ -38,33 +38,33 @@ pub fn open_temp(self: @This(), io: std.Io, sub: []const u8) !std.Io.Dir {
     return try sub_dir.openDir(io, &uuid, .{});
 }
 
-pub fn open_config_dir(alloc: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !std.Io.Dir {
+pub fn open_config_dir(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !std.Io.Dir {
     const path = try if (env.get("XDG_CONFIG_HOME")) |xdg|
-        std.fs.path.join(alloc, &.{ xdg, "weft" })
+        std.fs.path.join(gpa, &.{ xdg, "weft" })
     else if (env.get("HOME")) |home|
-        std.fs.path.join(alloc, &.{ home, ".config", "weft" })
+        std.fs.path.join(gpa, &.{ home, ".config", "weft" })
     else
         return error.NoHomeFound;
-    defer alloc.free(path);
+    defer gpa.free(path);
     try std.Io.Dir.cwd().createDirPath(io, path);
     return try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 }
 
-pub fn open_data_dir(alloc: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !std.Io.Dir {
+pub fn open_data_dir(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !std.Io.Dir {
     const path = try if (env.get("HOME")) |home|
-        std.fs.path.join(alloc, &.{ home, ".weft" })
+        std.fs.path.join(gpa, &.{ home, ".weft" })
     else
         return error.NoHomeFound;
-    defer alloc.free(path);
+    defer gpa.free(path);
     try std.Io.Dir.cwd().createDirPath(io, path);
     return try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 }
 
-pub fn get_remotes(self: @This(), alloc: std.mem.Allocator, io: std.Io, term: *Term) ![]Remote {
+pub fn get_remotes_leaky(self: @This(), gpa: std.mem.Allocator, io: std.Io, term: *Term) ![]Remote {
     const content = self.config_dir.readFileAllocOptions(
         io,
         remotes_zon_file_name,
-        alloc,
+        gpa,
         .unlimited,
         .of(u8),
         0,
@@ -73,10 +73,10 @@ pub fn get_remotes(self: @This(), alloc: std.mem.Allocator, io: std.Io, term: *T
             &.{}
         else
             err;
-    defer alloc.free(content);
+    defer gpa.free(content);
     var diag: std.zon.parse.Diagnostics = .{};
 
-    return std.zon.parse.fromSliceAlloc([]Remote, alloc, content, &diag, .{}) catch |err| {
+    return std.zon.parse.fromSliceAlloc([]Remote, gpa, content, &diag, .{}) catch |err| {
         try diag.format(term.writer());
         term.flush() catch {};
         return err;
@@ -88,6 +88,7 @@ pub fn save_remotes(self: @This(), io: std.Io, remotes: []const Remote) !void {
         .permissions = read_only_user_permissions,
         .replace = true,
     });
+    defer atomic.deinit(io);
     var buffer: [4 << 10]u8 = undefined;
     var writer = atomic.file.writer(io, &buffer);
     try std.zon.stringify.serialize(remotes, .{}, &writer.interface);

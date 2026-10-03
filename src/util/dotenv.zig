@@ -50,7 +50,7 @@ pub fn parse(alloc: std.mem.Allocator, content: []const u8) !Map {
     return map;
 }
 
-pub fn load_env(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, env_name: ?[]const u8) !DotEnv {
+pub fn load_env(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, env_name: ?[]const u8) !?DotEnv {
     var result: DotEnv = .{};
     errdefer result.deinit(alloc);
 
@@ -85,13 +85,24 @@ pub fn load_env(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, env_name:
                     return err;
                 }
             }
-
-            if (!loaded_override) {
-                return error.EnvFileNotFound;
-            }
+            if (!loaded_override)
+                return null;
         }
     }
 
+    return result;
+}
+
+pub fn load_file(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, filename: []const u8) !?DotEnv {
+    var result: DotEnv = .{};
+    errdefer result.deinit(alloc);
+    const content = dir.readFileAllocOptions(io, filename, alloc, .limited(1 << 20), .of(u8), 0) catch |err| {
+        if (err == error.FileNotFound)
+            return null;
+        return err;
+    };
+    try result.contents.append(alloc, content);
+    try parse_into(alloc, &result.map, content);
     return result;
 }
 
