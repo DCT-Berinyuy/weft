@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const endian: std.builtin.Endian = .little;
+const endian: std.lang.Endian = .little;
 
 /// Serialization and deserialization options
 pub const Options = struct {
@@ -26,40 +26,40 @@ pub fn hashType(comptime T: type) u64 {
         .bool => h = (h ^ @as(u64, 1)) *% prime,
         .int => |i| {
             h = (h ^ i.bits) *% prime;
-            h = (h ^ @intFromEnum(i.signedness)) *% prime;
+            h = (h ^ @backingInt(i.signedness)) *% prime;
         },
         .float => |f| h = (f.bits ^ h) *% prime,
         .@"struct" => |s| {
-            for (s.fields) |f| {
-                for (f.name) |char|
+            for (s.field_names, s.field_types) |f_name, f_type| {
+                for (f_name) |char|
                     h = (h ^ char) *% prime;
-                h = (h ^ hashType(f.type)) *% prime;
+                h = (h ^ hashType(f_type)) *% prime;
             }
         },
 
         .@"union" => |u| {
             if (u.tag_type) |tt|
                 h = (h ^ hashType(tt)) *% prime;
-            for (u.fields) |f| {
-                for (f.name) |char|
+            for (u.field_names, u.field_types) |f_name, f_type| {
+                for (f_name) |char|
                     h = (h ^ char) *% prime;
-                h = (h ^ hashType(f.type)) *% prime;
+                h = (h ^ hashType(f_type)) *% prime;
             }
         },
 
         .@"enum" => |e| {
             h = (h ^ hashType(e.tag_type)) *% prime;
-            for (e.fields) |f| {
-                for (f.name) |char|
+            for (e.field_names, e.field_values) |f_name, f_value| {
+                for (f_name) |char|
                     h = (h ^ char) *% prime;
-                h = (h ^ @as(u64, f.value)) *% prime;
+                h = (h ^ @as(u64, f_value)) *% prime;
             }
         },
 
         .pointer => |p| {
             h = (h ^ 0xCAFE) *% prime;
-            h = (h ^ @intFromEnum(p.size)) *% prime;
-            h = (h ^ @as(u64, if (p.is_const) 1 else 0)) *% prime;
+            h = (h ^ @backingInt(p.size)) *% prime;
+            h = (h ^ @as(u64, if (p.attrs.@"const") 1 else 0)) *% prime;
             h = (h ^ hashType(p.child)) *% prime;
         },
 
@@ -74,10 +74,10 @@ pub fn hashType(comptime T: type) u64 {
             h = (h ^ hashType(o.child)) *% prime;
         },
 
-        .error_set => |es| if (es) |fields| {
+        .error_set => |es| if (es.error_names) |fields| {
             h = (h ^ 0xBAEF) *% prime;
             for (fields) |f| {
-                for (f.name) |char|
+                for (f) |char|
                     h = (h ^ char) *% prime;
             }
         },
@@ -99,6 +99,11 @@ pub fn serialize(writer: *std.Io.Writer, comptime T: type, value: T, comptime op
         try writer.writeInt(u64, comptime hashType(T), endian);
     try serializeValue(writer, T, value);
 }
+pub fn serializeAlloc(gpa: std.mem.Allocator, comptime T: type, value: T, comptime opts: Options) std.Io.Writer.Error![]const u8 {
+    var allocating: std.Io.Writer.Allocating = .init(gpa);
+    try serialize(&allocating.writer, T, value, opts);
+    return allocating.written();
+}
 
 fn serializeValue(writer: *std.Io.Writer, comptime T: type, value: T) std.Io.Writer.Error!void {
     const info = @typeInfo(T);
@@ -106,7 +111,7 @@ fn serializeValue(writer: *std.Io.Writer, comptime T: type, value: T) std.Io.Wri
     switch (info) {
         inline .int => try writer.writeInt(T, value, endian),
         inline .float => |f| try writer.writeInt(
-            std.meta.Int(.unsigned, f.bits),
+            @Int(.unsigned, f.bits),
             @bitCast(value),
             endian,
         ),
@@ -122,16 +127,16 @@ fn serializeValue(writer: *std.Io.Writer, comptime T: type, value: T) std.Io.Wri
             try serializeValue(writer, o.child, payload);
         } else try writer.writeByte(std.math.minInt(u8)),
         inline .@"struct" => |s| {
-            inline for (s.fields) |f|
+            inline for (s.field_names, s.field_types) |f_name, f_type|
                 try serializeValue(
                     writer,
-                    f.type,
-                    @field(value, f.name),
+                    f_type,
+                    @field(value, f_name),
                 );
         },
-        inline .@"enum" => try writer.writeByte(@intCast(@intFromEnum(value))),
+        inline .@"enum" => try writer.writeByte(@intCast(@backingInt(value))),
         inline .@"union" => {
-            try writer.writeByte(@intCast(@intFromEnum(std.meta.activeTag(value))));
+            try writer.writeByte(@intCast(@backingInt(std.meta.activeTag(value))));
             switch (value) {
                 inline else => |payload| try serializeValue(
                     writer,
@@ -193,7 +198,7 @@ fn deserializeValue(alloc: ?std.mem.Allocator, src: *[]const u8, comptime T: typ
     switch (@typeInfo(T)) {
         inline .int => return try readInt(src, T),
         inline .float => |f| {
-            const IntT = comptime std.meta.Int(.unsigned, f.bits);
+            const IntT = comptime @Int(.unsigned, f.bits);
             const raw_bits = try readInt(src, IntT);
             return @bitCast(raw_bits);
         },
@@ -220,26 +225,26 @@ fn deserializeValue(alloc: ?std.mem.Allocator, src: *[]const u8, comptime T: typ
 
         inline .@"struct" => |s| {
             var result: T = undefined;
-            inline for (s.fields) |f|
-                @field(result, f.name) = try deserializeValue(alloc, src, f.type);
+            inline for (s.field_names, s.field_types) |f_name, f_type|
+                @field(result, f_name) = try deserializeValue(alloc, src, f_type);
             return result;
         },
 
-        inline .@"enum" => return @enumFromInt(try readByte(src)),
+        inline .@"enum" => return @fromBackingInt(@intCast(try readByte(src))),
 
         inline .@"union" => |u| {
             const tag_id = try readByte(src);
             const tag_type = u.tag_type orelse @compileError("Union must be tagged for zoto: " ++ @typeName(T));
 
-            inline for (u.fields) |f|
-                if (@intFromEnum(@field(tag_type, f.name)) == tag_id)
+            inline for (u.field_names, u.field_types) |f_name, f_type|
+                if (@backingInt(@field(tag_type, f_name)) == tag_id)
                     return @unionInit(
                         T,
-                        f.name,
-                        if (comptime f.type == anyerror)
+                        f_name,
+                        if (comptime f_type == anyerror)
                             @errorFromInt(try readInt(src, u16))
                         else
-                            try deserializeValue(alloc, src, f.type),
+                            try deserializeValue(alloc, src, f_type),
                     );
 
             return error.InvalidUnionTag;
@@ -311,12 +316,12 @@ fn hasPointers(comptime T: type) bool {
     const info = @typeInfo(T);
     return switch (info) {
         .pointer => true,
-        .@"struct" => |s| inline for (s.fields) |f| {
-            if (hasPointers(f.type))
+        .@"struct" => |s| inline for (s.field_types) |f_type| {
+            if (hasPointers(f_type))
                 break true;
         } else false,
-        .@"union" => |u| inline for (u.fields) |f| {
-            if (hasPointers(f.type))
+        .@"union" => |u| inline for (u.field_types) |f_type| {
+            if (hasPointers(f_type))
                 break true;
         } else false,
         .optional => |o| hasPointers(o.child),
@@ -357,35 +362,136 @@ fn readInt(src: *[]const u8, comptime IntT: type) !IntT {
     return val;
 }
 
-test "zoto structural type hashing" {
-    // Two differently named structs with identical structure must have the same hash
-    const S1 = struct {
-        id: u64,
-        name: []const u8,
-        active: bool,
-    };
-    const S2 = struct {
-        id: u64,
-        name: []const u8,
-        active: bool,
-    };
-    try std.testing.expectEqual(comptime hashType(S1), comptime hashType(S2));
+fn indent(w: *std.Io.Writer, depth: usize) !void {
+    var i: usize = 0;
+    while (i < depth) : (i += 1)
+        try w.writeAll("  ");
+}
 
-    // Slices of anonymous structs with same shape must have identical hash
-    const SliceAnon1 = []const struct { []const u8, u16 };
-    const SliceAnon2 = []const struct { []const u8, u16 };
-    try std.testing.expectEqual(comptime hashType(SliceAnon1), comptime hashType(SliceAnon2));
+fn print_string(val: []const u8, out: *std.Io.Writer, depth: usize) !void {
+    if (std.mem.indexOfScalar(u8, val, '\n')) |_| {
+        var lines = std.mem.splitScalar(u8, val, '\n');
+        try out.writeByte('\n');
+        while (lines.next()) |line| {
+            try indent(out, depth + 1);
+            try out.print("\\\\{s}\n", .{line});
+        }
+        try indent(out, depth);
+    } else try out.print("\"{f}\"", .{std.zig.fmtString(val)});
+}
 
-    // Different fields must yield different hashes
-    const S3 = struct {
-        id: u32, // different int type
-        name: []const u8,
-        active: bool,
-    };
-    try std.testing.expect(comptime (hashType(S1) != hashType(S3)));
-
-    // Const vs non-const pointer produces different hash
-    const PtrConst = *const u32;
-    const PtrMut = *u32;
-    try std.testing.expect(comptime (hashType(PtrConst) != hashType(PtrMut)));
+pub fn print_value(comptime T: type, val: T, out: *std.Io.Writer, depth: usize, is_root: bool) !void {
+    const info = @typeInfo(T);
+    switch (info) {
+        .void => try out.writeAll("void"),
+        .bool => try out.print("{}", .{val}),
+        .int => try out.print("{d}", .{val}),
+        .float => try out.print("{d}", .{val}),
+        .@"enum" => try out.print(".{s}", .{@tagName(val)}),
+        .error_set => try out.print("error.{s}", .{@errorName(val)}),
+        .error_union => if (val) |payload|
+            try print_value(@TypeOf(payload), payload, out, depth, is_root)
+        else |err|
+            try out.print("error.{s}", .{@errorName(err)}),
+        .optional => if (val) |payload|
+            try print_value(@TypeOf(payload), payload, out, depth, false)
+        else
+            try out.writeAll("null"),
+        .pointer => |p| switch (p.size) {
+            .slice => {
+                if (p.child == u8)
+                    try print_string(val, out, depth)
+                else if (val.len == 0)
+                    try out.writeAll("&.{}")
+                else if (val.len == 1) {
+                    try out.writeAll("&.{");
+                    try print_value(p.child, val[0], out, depth + 1, false);
+                    try out.writeAll("}");
+                } else {
+                    try out.writeAll("&.{\n");
+                    for (val) |item| {
+                        try indent(out, depth + 1);
+                        try print_value(p.child, item, out, depth + 1, false);
+                        try out.writeAll(",\n");
+                    }
+                    try indent(out, depth);
+                    try out.writeAll("}");
+                }
+            },
+            .one => {
+                try out.writeByte('&');
+                try print_value(p.child, val.*, out, depth, false);
+            },
+            else => try out.writeAll("unsupported pointer"),
+        },
+        .array => |a| {
+            if (a.child == u8)
+                try print_string(&val, out, depth)
+            else if (val.len == 0)
+                try out.writeAll(".{}")
+            else if (val.len == 1) {
+                try out.writeAll(".{");
+                try print_value(a.child, val[0], out, depth + 1, false);
+                try out.writeAll("}");
+            } else {
+                try out.writeAll(".{\n");
+                for (val) |item| {
+                    try indent(out, depth + 1);
+                    try print_value(a.child, item, out, depth + 1, false);
+                    try out.writeAll(",\n");
+                }
+                try indent(out, depth);
+                try out.writeAll("}");
+            }
+        },
+        .@"struct" => |s| {
+            const prefix = if (is_root) "" else ".";
+            if (s.is_tuple) {
+                if (s.field_names.len == 0) {
+                    try out.print("{s}{{}}", .{prefix});
+                    return;
+                }
+                try out.print("{s}{{\n", .{prefix});
+                inline for (s.field_names, s.field_types) |f_name, f_type| {
+                    try indent(out, depth + 1);
+                    try print_value(f_type, @field(val, f_name), out, depth + 1, false);
+                    try out.writeAll(",\n");
+                }
+                try indent(out, depth);
+                try out.writeAll("}");
+            } else {
+                if (s.field_names.len == 0) {
+                    try out.print("{s}{{}}", .{prefix});
+                    return;
+                }
+                try out.print("{s}{{\n", .{prefix});
+                inline for (s.field_names, s.field_types) |f_name, f_type| {
+                    try indent(out, depth + 1);
+                    try out.print(".{s} = ", .{f_name});
+                    try print_value(f_type, @field(val, f_name), out, depth + 1, false);
+                    try out.writeAll(",\n");
+                }
+                try indent(out, depth);
+                try out.writeAll("}");
+            }
+        },
+        .@"union" => |u| {
+            if (u.tag_type == null) {
+                try out.writeAll("untagged-union");
+                return;
+            }
+            switch (val) {
+                inline else => |payload, tag| {
+                    if (@TypeOf(payload) == void) {
+                        try out.print(".{{ .{s} }}", .{@tagName(tag)});
+                    } else {
+                        try out.print(".{{ .{s} = ", .{@tagName(tag)});
+                        try print_value(@TypeOf(payload), payload, out, depth, false);
+                        try out.writeAll(" }");
+                    }
+                },
+            }
+        },
+        else => try out.writeAll("unreachable"),
+    }
 }

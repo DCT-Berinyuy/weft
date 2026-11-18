@@ -1,17 +1,18 @@
 const std = @import("std");
+const log = std.log.scoped;
 
+const domain = @import("../domain/domain.zig");
 const paths = @import("../domain/paths.zig");
 const proto = @import("../domain/proto.zig");
 const spawn = @import("../domain/spawn.zig").spawn;
-const Term = @import("../domain/Term.zig");
+const CGroup2 = @import("../util/CGroup2.zig");
 const zoto = @import("../util/zoto.zig");
 const Connection = @import("../wire/Connection.zig");
+const Crypt = @import("../wire/Crypt.zig");
 const DaemonInstall = @import("DaemonInstall.zig");
 const handler = @import("handler.zig");
 const Server = @import("Server.zig");
-const SharedPressor = @import("SharedPressor.zig");
 const StatsServer = @import("StatsServer.zig");
-const Store = @import("Store.zig");
 const Task = @import("Task.zig");
 
 io: std.Io,
@@ -20,30 +21,31 @@ arena: std.heap.ArenaAllocator,
 install: DaemonInstall,
 server: Server,
 config: DaemonInstall.Config,
-term: *Term,
-pressor: SharedPressor,
 stats_server: StatsServer,
-store: Store,
+keys: [][32]u8,
+keys_lock: std.Io.Mutex,
 
 pub fn deinit(self: *@This()) void {
+    self.gpa.free(self.keys);
     self.server.deinit(self.io);
-    self.pressor.deinit(self.gpa);
     self.stats_server.deinit();
-    std.zon.parse.free(self.gpa, self.config);
-    self.store.deinit();
+    self.arena.deinit();
 }
-pub fn init(gpa: std.mem.Allocator, io: std.Io, install: DaemonInstall, term: *Term) !@This() {
+pub fn init(gpa: std.mem.Allocator, io: std.Io, install: DaemonInstall) !@This() {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const alloc = arena.allocator();
-    const config = try DaemonInstall.read_config_leaky(io, alloc, term);
+    const config = try DaemonInstall.read_config_leaky(alloc, io);
 
     var server = try Server.init(
         io,
-        &try config.get_secret(),
         config.port,
     );
     errdefer server.deinit(io);
+
+    const keys = try DaemonInstall.get_keys(gpa, io);
+    errdefer gpa.free(keys);
+
     return .{
         .gpa = gpa,
         .arena = arena,
@@ -51,20 +53,41 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, install: DaemonInstall, term: *T
         .install = install,
         .config = config,
         .server = server,
-        .term = term,
-        .pressor = try .init(gpa, io),
-        .stats_server = try .init(gpa, io, term),
-        .store = Store.init(gpa, term),
+        .stats_server = try .init(gpa, io),
+        .keys = keys,
+        .keys_lock = .init,
     };
 }
 
+pub fn validate_key(self: *@This(), key: [32]u8) bool {
+    self.keys_lock.lockUncancelable(self.io);
+    defer self.keys_lock.unlock(self.io);
+    return for (self.keys) |vkey| {
+        if (std.crypto.timing_safe.eql([32]u8, key, vkey))
+            break true;
+    } else false;
+}
+
+pub fn reload(self: *@This()) !void {
+    const l = log(.daemon_keys);
+    const new_keys = try DaemonInstall.get_keys(self.gpa, self.io);
+    self.keys_lock.lockUncancelable(self.io);
+    defer self.keys_lock.unlock(self.io);
+    self.gpa.free(self.keys);
+    self.keys = new_keys;
+    l.info("reloaded {d} client keys", .{new_keys.len});
+    //LEAK: The previous config ain't freed
+    self.config = try DaemonInstall.read_config_leaky(self.arena.allocator(), self.io);
+}
+
 pub fn run_client_server(self: *@This()) !void {
-    self.term.info("listening on TCP :{d}", .{self.config.port});
+    const l = log(.client_server);
+    l.info("listening on TCP :{d}", .{self.config.port});
 
     var group: std.Io.Group = .init;
     defer group.cancel(self.io);
 
-    var permits: std.Io.Semaphore = .{ .permits = self.config.max_workers };
+    var permits: std.Io.Semaphore = .{ .permits = self.config.scale.max_workers };
 
     while (true) {
         try permits.wait(self.io);
@@ -73,22 +96,34 @@ pub fn run_client_server(self: *@This()) !void {
             break :req self.server.accept(self.io) catch |err| {
                 if (err == error.Canceled)
                     return;
-                self.term.err("accept error: {any}", .{err});
-                std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch {};
+                l.err("accept error: {any}", .{err});
+                try std.Io.sleep(self.io, .fromMilliseconds(100), .awake);
                 continue :req;
             };
 
-        try spawn(self.io, &group, handler.handle, .{ self, &permits, stream });
+        _ = try spawn(self.io, &group, handler.handle, .{ self, &permits, stream });
     }
 }
 
 pub fn run_system_server(self: *@This()) !void {
+    while (true) {
+        self._run_system_server() catch |err| {
+            if (err == error.Canceled)
+                return err
+            else {
+                if (@errorReturnTrace()) |trace|
+                    std.debug.dumpErrorReturnTrace(trace);
+                log(.system_server).err("system server recoverable error: {any}", .{err});
+            }
+        };
+    }
+}
+pub fn _run_system_server(self: *@This()) !void {
+    const l = log(.system_server);
     var group: std.Io.Group = .init;
     defer group.cancel(self.io);
 
     defer std.Io.Dir.deleteFileAbsolute(self.io, paths.weft_socket) catch {};
-
-    std.Io.Dir.cwd().createDirPath(self.io, paths.weft_runtime_dir) catch {};
 
     const addr: std.Io.net.UnixAddress = try .init(paths.weft_socket);
     std.Io.Dir.deleteFileAbsolute(self.io, paths.weft_socket) catch |err|
@@ -109,7 +144,7 @@ pub fn run_system_server(self: *@This()) !void {
         done,
         invalid_request: []const u8,
     };
-    self.term.info("listening on socket {s}", .{paths.weft_socket});
+    l.info("listening on socket {s}", .{paths.weft_socket});
     var req_arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer req_arena.deinit();
     run: switch (@as(Run, .accept)) {
@@ -130,16 +165,17 @@ pub fn run_system_server(self: *@This()) !void {
                 proto.DaemonMsg,
                 .{ .header = true },
             );
-            self.term.info("daemon cmd: {any}", .{cmd});
+            l.info("received command: {any}", .{cmd});
             switch (cmd) {
-                .task_completed => |msg| {
-                    try spawn(self.io, &group, finalize_task, .{ self, Task{ .id = try msg.task.dupe(self.gpa) }, msg.status });
+                .reload => {
+                    self.reload() catch |err|
+                        l.err("failed to reload keys: {any}", .{err});
                     continue :run .done;
                 },
             }
         },
         .invalid_request => |msg| {
-            self.term.err("  invalid request: {s}", .{msg});
+            l.err("invalid request: {s}", .{msg});
             conn.close(self.io);
         },
         .done => {
@@ -151,65 +187,111 @@ pub fn run_system_server(self: *@This()) !void {
 }
 
 fn handle_signal(sig: std.posix.SIG) callconv(.c) void {
-    std.debug.print("Someone wanted to push us with a {any}, but we're still exiting gracefuly...", .{sig});
+    const l = log(.handle_signal);
+    l.info("received {s}, shutting down", .{@tagName(sig)});
 
     std.process.exit(0);
 }
 
 pub fn run(self: *@This()) !void {
-    paths.ensure_dirs(self.io);
+    _ = std.os.linux.syscall3(.setpriority, 0, 0, 10);
+    const cwd: std.Io.Dir = .cwd();
+    const l = log(.daemon);
+    const pid = std.os.linux.getpid();
+    var pid_buf: [16]u8 = undefined;
+    const pid_str = std.fmt.bufPrint(&pid_buf, "{d}\n", .{pid}) catch unreachable;
+    try cwd.createDirPath(self.io, paths.weft_run);
+    try domain.write_file_atomic(self.io, cwd, paths.weft_pid, pid_str, .{ .replace = true });
+    defer std.Io.Dir.cwd().deleteFile(self.io, paths.weft_pid) catch {};
+
+    try paths.ensure_dirs(self.io);
+    DaemonInstall.setup_bin(self.gpa, self.io) catch |err|
+        l.warn("could not setup bin dir: {any}", .{err});
+
+    if (self.config.isolate.cgroups) init_cgroup: {
+        var root_cg = CGroup2.init_absolute_take("/sys/fs/cgroup");
+        for ([_][]const u8{ "+cpu", "+memory", "+io", "+pids" }) |ctrl|
+            try root_cg.subtree_control_set(self.gpa, self.io, ctrl);
+
+        var weft_cg = CGroup2.init(self.gpa, "weft") catch break :init_cgroup;
+        defer weft_cg.deinit(self.gpa);
+        weft_cg.create(self.io) catch |err|
+            l.warn("could not create /sys/fs/cgroup/weft: {any}", .{err});
+        for ([_][]const u8{ "+cpu", "+memory", "+io", "+pids" }) |ctrl|
+            try weft_cg.subtree_control_set(self.gpa, self.io, ctrl);
+    }
 
     var group: std.Io.Group = .init;
 
-    try spawn(self.io, &group, run_client_server, .{self});
-    try spawn(self.io, &group, StatsServer.run, .{&self.stats_server});
-    try spawn(self.io, &group, run_system_server, .{self});
+    _ = try spawn(self.io, &group, run_client_server, .{self});
+    _ = try spawn(self.io, &group, StatsServer.run, .{&self.stats_server});
+    _ = try spawn(self.io, &group, run_system_server, .{self});
+
+    l.info("starting on port {d} (pid {d})", .{ self.config.port, std.os.linux.getpid() });
+    defer l.info("stopped", .{});
 
     try group.await(self.io);
 }
 
-pub fn finalize_task(self: *@This(), task: Task, status: u16) !void {
-    defer task.free_duped(self.gpa);
-    const cwd = std.Io.Dir.cwd();
-    const run_dir_path = try task.run_dir_path(self.gpa);
-    defer self.gpa.free(run_dir_path);
+pub fn connect(self: *@This(), reader: *std.Io.Reader, writer: *std.Io.Writer) !Connection {
+    const l = log(.client_server);
+    var hello: Crypt.ClientHello = undefined;
+    try reader.readSliceAll(std.mem.asBytes(&hello));
+    if (!std.mem.eql(u8, &hello.magic, &Crypt.magick))
+        return error.InvalidProtocol;
 
-    const run_dir = cwd.openDir(self.io, run_dir_path, .{}) catch |err|
-        return if (err == error.FileNotFound) error.TaskNotFound else err;
-    defer run_dir.close(self.io);
-    defer cwd.deleteTree(self.io, run_dir_path) catch {};
-
-    if (status != 0) {
-        self.term.warn("task {s} failed with exit code {d}, skipping artifact promotion", .{ task.id.pipeline, status });
-        return;
+    if (!self.validate_key(hello.client_public)) {
+        l.warn("rejecting client: key not authorized", .{});
+        var reject_msg: Crypt.ServerChallenge = .{
+            .status = .unauthorized,
+            .challenge = undefined,
+            .server_nonce = undefined,
+            .server_temp_pub = undefined,
+        };
+        try writer.writeAll(std.mem.asBytes(&reject_msg));
+        try writer.flush();
+        return error.ClientUnauthorized;
     }
 
-    const output_dirs_path = try std.fs.path.join(self.gpa, &.{ run_dir_path, "out" });
-    defer self.gpa.free(output_dirs_path);
+    var challenge: [32]u8 = undefined;
+    try self.io.randomSecure(&challenge);
+    const temp_dh = std.crypto.dh.X25519.KeyPair.generate(self.io);
+    const out_nonce = try Crypt.Nonce.random(self.io);
 
-    const artifacts_dir_path = try task.artifacts_path(self.gpa);
-    defer self.gpa.free(artifacts_dir_path);
-    const artifacts_dir = try cwd.createDirPathOpen(self.io, artifacts_dir_path, .{});
-    defer artifacts_dir.close(self.io);
-
-    const outputs_dir = cwd.openDir(self.io, output_dirs_path, .{ .iterate = true }) catch |err| {
-        if (err == error.FileNotFound) return;
-        return err;
+    const status: Crypt.ServerChallenge.Status = if (hello.proto_hash == proto.hash)
+        .ok
+    else
+        .proto_mismatch;
+    const challenge_msg: Crypt.ServerChallenge = .{
+        .status = status,
+        .challenge = challenge,
+        .server_temp_pub = temp_dh.public_key,
+        .server_nonce = out_nonce.to_bytes(),
     };
-    defer outputs_dir.close(self.io);
+    try writer.writeAll(std.mem.asBytes(&challenge_msg));
+    try writer.flush();
+    if (status != .ok)
+        return error.ProtocolMismatch;
 
-    var outputs: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (outputs.items) |name|
-            self.gpa.free(name);
-        outputs.deinit(self.gpa);
-    }
-    var it = outputs_dir.iterate();
-    while (try it.next(self.io)) |entry|
-        try outputs.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+    var auth: Crypt.ClientAuth = undefined;
+    try reader.readSliceAll(std.mem.asBytes(&auth));
 
-    for (outputs.items) |name| {
-        artifacts_dir.deleteTree(self.io, name) catch {};
-        try outputs_dir.rename(name, artifacts_dir, name, self.io);
-    }
+    const sign_data = Crypt.make_sign_data(&challenge, &temp_dh.public_key);
+    Crypt.Identity.verify(hello.client_public, &sign_data, auth.signature) catch
+        return error.AuthenticationFailed;
+
+    const shared_secret = try std.crypto.dh.X25519.scalarmult(
+        temp_dh.secret_key,
+        hello.client_temp_pub,
+    );
+
+    var in_nonce_bytes = hello.client_nonce;
+    const in_nonce = try Crypt.Nonce.from_bytes(&in_nonce_bytes);
+
+    return .{
+        .reader = reader,
+        .writer = writer,
+        .write_crypt = .init(&shared_secret, out_nonce),
+        .read_crypt = .init(&shared_secret, in_nonce),
+    };
 }

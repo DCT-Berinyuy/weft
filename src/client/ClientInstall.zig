@@ -1,31 +1,113 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const build = @import("build");
 
 const Term = @import("../domain/Term.zig");
+const Weft = @import("../domain/Weft.zig");
+const Identity = @import("../wire/Identity.zig");
 const Deployment = @import("Deployment.zig");
-pub const Remote = @import("Remote.zig");
+const Project = @import("Project.zig");
 
-pub const read_only_user_permissions = @as(std.Io.File.Permissions, @enumFromInt(@as(u32, std.os.linux.S.IRUSR | std.os.linux.S.IWUSR)));
-pub const read_only_user_mode = read_only_user_permissions.toMode();
-pub const remotes_zon_file_name = "remotes.zon";
+pub const key_file_name = "key";
+pub const config_file_name = "config.zon";
+
+pub const Remote = struct {
+    []const u8,
+    []const u8,
+};
+
+pub const Config = struct {
+    remotes: []const Remote = &.{},
+};
 
 config_dir: std.Io.Dir,
 data_dir: std.Io.Dir,
 temp_dir: std.Io.Dir,
+identity: Identity,
 env: *const std.process.Environ.Map,
+config: Config,
 
-pub fn init(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !@This() {
+pub fn init(gpa: std.mem.Allocator, ara: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !@This() {
     const config_dir = try open_config_dir(gpa, io, env);
     const data_dir = try open_data_dir(gpa, io, env);
 
-    data_dir.createDirPath(io, "temp") catch {};
+    try data_dir.createDirPath(io, "temp");
     const temp_dir = try data_dir.openDir(io, "temp", .{ .iterate = true });
 
-    return .{
+    const identity = try Identity.ensure(io, config_dir, key_file_name);
+    try ensure_config(io, config_dir);
+    var self: @This() = .{
         .config_dir = config_dir,
         .data_dir = data_dir,
         .temp_dir = temp_dir,
+        .identity = identity,
         .env = env,
+        .config = undefined,
     };
+
+    self.config = self.read_config_leaky(gpa, ara, io) catch |err| {
+        std.log.warn("failed to read config.zon: {any}", .{err});
+        return err;
+    };
+    return self;
+}
+
+pub fn ensure_config(io: std.Io, dir: std.Io.Dir) !void {
+    if (dir.access(io, "client.zon", .{})) |_|
+        return
+    else |_| {}
+    if (dir.access(io, config_file_name, .{})) |_|
+        return
+    else |_| {}
+
+    var file = dir.createFile(io, config_file_name, .{
+        .exclusive = true,
+    }) catch |err|
+        if (err == error.PathAlreadyExists)
+            return
+        else
+            return err;
+    defer file.close(io);
+
+    const default_content =
+        \\.{
+        \\    .remotes = .{
+        \\        .{ "local", "127.0.0.1:9338" },
+        \\    },
+        \\}
+        \\
+    ;
+    try file.writePositionalAll(io, default_content, 0);
+}
+
+pub fn read_config_leaky(self: @This(), gpa: std.mem.Allocator, ara: std.mem.Allocator, io: std.Io) !Config {
+    var filename: []const u8 = "client.zon";
+    const content = self.config_dir.readFileAllocOptions(io, filename, ara, .unlimited, .of(u8), 0) catch |e| blk: {
+        if (e == error.FileNotFound) {
+            filename = config_file_name;
+            break :blk self.config_dir.readFileAllocOptions(io, filename, ara, .unlimited, .of(u8), 0) catch |err|
+                if (err == error.FileNotFound)
+                    return .{}
+                else
+                    return err;
+        } else return e;
+    };
+    var diag: std.zon.parse.Diagnostics = .{ .errors = &.{undefined} };
+    return std.zon.parse.fromSlice(Config, .{
+        .arena = ara,
+        .gpa = gpa,
+        .source = content,
+        .diagnostics = &diag,
+    }) catch |err| {
+        if (err == error.ParseZon)
+            diag.log(filename);
+        return err;
+    };
+}
+
+pub fn locate_script(self: @This(), gpa: std.mem.Allocator, io: std.Io, name: []const u8) !?[:0]const u8 {
+    return Project.locate_script_in_dir(io, self.config_dir, gpa, name);
 }
 pub fn open_temp(self: @This(), io: std.Io, sub: []const u8) !std.Io.Dir {
     const uuid = (try Deployment.Id.now(io)).to_string();
@@ -39,59 +121,46 @@ pub fn open_temp(self: @This(), io: std.Io, sub: []const u8) !std.Io.Dir {
 }
 
 pub fn open_config_dir(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !std.Io.Dir {
-    const path = try if (env.get("XDG_CONFIG_HOME")) |xdg|
-        std.fs.path.join(gpa, &.{ xdg, "weft" })
-    else if (env.get("HOME")) |home|
-        std.fs.path.join(gpa, &.{ home, ".config", "weft" })
-    else
-        return error.NoHomeFound;
+    const path = path: {
+        if (builtin.os.tag == .windows) {
+            if (env.get("APPDATA")) |appdata| {
+                const path = try std.fs.path.join(gpa, &.{ appdata, build.app_id });
+                break :path path;
+            } else {
+                return error.NoAppData;
+            }
+        } else {
+            const path = try if (env.get("XDG_CONFIG_HOME")) |xdg|
+                std.fs.path.join(gpa, &.{ xdg, "weft" })
+            else if (env.get("HOME")) |home|
+                std.fs.path.join(gpa, &.{ home, ".config", "weft" })
+            else
+                return error.NoHomeFound;
+            break :path path;
+        }
+    };
     defer gpa.free(path);
-    try std.Io.Dir.cwd().createDirPath(io, path);
-    return try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    return try std.Io.Dir.cwd().createDirPathOpen(io, path, .{});
 }
 
 pub fn open_data_dir(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !std.Io.Dir {
-    const path = try if (env.get("HOME")) |home|
-        std.fs.path.join(gpa, &.{ home, ".weft" })
-    else
-        return error.NoHomeFound;
+    const path = path: {
+        if (builtin.os.tag == .windows) {
+            if (env.get("LOCALAPPDATA")) |appdata| {
+                const path = try std.fs.path.join(gpa, &.{ appdata, build.app_id });
+                break :path path;
+            } else {
+                return error.NoAppData;
+            }
+        } else {
+            break :path try if (env.get("HOME")) |home|
+                std.fs.path.join(gpa, &.{ home, ".weft" })
+            else
+                return error.NoHomeFound;
+        }
+    };
+
     defer gpa.free(path);
     try std.Io.Dir.cwd().createDirPath(io, path);
     return try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
-}
-
-pub fn get_remotes_leaky(self: @This(), gpa: std.mem.Allocator, io: std.Io, term: *Term) ![]Remote {
-    const content = self.config_dir.readFileAllocOptions(
-        io,
-        remotes_zon_file_name,
-        gpa,
-        .unlimited,
-        .of(u8),
-        0,
-    ) catch |err|
-        return if (err == error.FileNotFound)
-            &.{}
-        else
-            err;
-    defer gpa.free(content);
-    var diag: std.zon.parse.Diagnostics = .{};
-
-    return std.zon.parse.fromSliceAlloc([]Remote, gpa, content, &diag, .{}) catch |err| {
-        try diag.format(term.writer());
-        term.flush() catch {};
-        return err;
-    };
-}
-
-pub fn save_remotes(self: @This(), io: std.Io, remotes: []const Remote) !void {
-    var atomic = try self.config_dir.createFileAtomic(io, remotes_zon_file_name, .{
-        .permissions = read_only_user_permissions,
-        .replace = true,
-    });
-    defer atomic.deinit(io);
-    var buffer: [4 << 10]u8 = undefined;
-    var writer = atomic.file.writer(io, &buffer);
-    try std.zon.stringify.serialize(remotes, .{}, &writer.interface);
-    try writer.interface.flush();
-    try atomic.replace(io);
 }

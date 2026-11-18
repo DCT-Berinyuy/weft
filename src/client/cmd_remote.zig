@@ -1,8 +1,8 @@
 const std = @import("std");
+const log = std.log.scoped;
 
 const Term = @import("../domain/Term.zig");
 const ClientInstall = @import("ClientInstall.zig");
-const Remote = @import("Remote.zig");
 
 const TargetInfo = struct {
     ssh_dest: []const u8,
@@ -10,9 +10,9 @@ const TargetInfo = struct {
     port: ?[]const u8,
 };
 
-fn parse_target(alloc: std.mem.Allocator, raw: []const u8) !TargetInfo {
+fn parse_target_leaky(ara: std.mem.Allocator, raw: []const u8) !TargetInfo {
     var user: []const u8 = "root";
-    var rest: []const u8 = raw;
+    var rest = raw;
 
     if (std.mem.indexOfScalar(u8, raw, '@')) |at_idx| {
         user = raw[0..at_idx];
@@ -30,7 +30,7 @@ fn parse_target(alloc: std.mem.Allocator, raw: []const u8) !TargetInfo {
         }
     }
 
-    const ssh_dest = try std.fmt.allocPrint(alloc, "{s}@{s}", .{ user, host });
+    const ssh_dest = try ara.print("{s}@{s}", .{ user, host });
 
     return .{
         .ssh_dest = ssh_dest,
@@ -39,67 +39,75 @@ fn parse_target(alloc: std.mem.Allocator, raw: []const u8) !TargetInfo {
     };
 }
 
-fn resolve_host(alloc: std.mem.Allocator, io: std.Io, ssh_dest: []const u8, maybe_port: ?[]const u8, fallback_host: []const u8) ![]const u8 {
-    const argv: []const []const u8 = if (maybe_port) |p|
-        &.{ "ssh", "-p", p, "-G", ssh_dest }
-    else
-        &.{ "ssh", "-G", ssh_dest };
+pub fn register(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    inst: *const ClientInstall,
+    ssh_target: []const u8,
+    maybe_pubkey: ?[]const u8,
+) !void {
+    const l = log(.remote_register);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
-    if (std.process.run(alloc, io, .{
-        .argv = argv,
-    })) |res| {
-        defer alloc.free(res.stdout);
-        defer alloc.free(res.stderr);
+    const target = try parse_target_leaky(alloc, ssh_target);
 
-        if (res.term == .exited and res.term.exited == 0) {
-            var it = std.mem.splitScalar(u8, res.stdout, '\n');
-            while (it.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, " \t\r");
-                if (std.mem.startsWith(u8, trimmed, "hostname ")) {
-                    const host = std.mem.trim(u8, trimmed["hostname ".len..], " \t\r");
-                    if (host.len > 0)
-                        return try alloc.dupe(u8, host);
-                }
-            }
-        }
-    } else |_| {}
+    const pubkey_hex: []const u8 = if (maybe_pubkey) |pk| pk else pk: {
+        const client_pub = inst.identity.public_key();
+        const hex = std.fmt.bytesToHex(client_pub, .lower);
+        break :pk try alloc.dupe(u8, &hex);
+    };
 
-    return try alloc.dupe(u8, fallback_host);
+    l.info("registering client key on {s}...", .{target.ssh_dest});
+    var reg_argv: std.ArrayList([]const u8) = .empty;
+    try reg_argv.appendSlice(alloc, &.{ "ssh", "-o", "RemoteCommand=none", "-o", "RequestTTY=no" });
+    if (target.port) |p|
+        try reg_argv.appendSlice(alloc, &.{ "-p", p });
+    try reg_argv.appendSlice(alloc, &.{
+        target.ssh_dest,
+        "/usr/local/bin/weft",
+        "daemon",
+        "register",
+        pubkey_hex,
+    });
+
+    const reg_res = try std.process.run(alloc, io, .{
+        .argv = reg_argv.items,
+    });
+    if (reg_res.term != .exited or reg_res.term.exited != 0) {
+        l.err(
+            "remote client registration failed (exit {any}):\nstderr: {s}\nstdout: {s}",
+            .{ reg_res.term, reg_res.stderr, reg_res.stdout },
+        );
+        return error.RemoteRegisterFailed;
+    }
+    l.info("successfully registered client key on {s}", .{target.ssh_dest});
 }
 
 pub fn install(
     gpa: std.mem.Allocator,
     io: std.Io,
-    term: *Term,
-    installation: ClientInstall,
-    name: []const u8,
+    installation: *const ClientInstall,
     ssh_target: []const u8,
-    weft_host: ?[]const u8,
-    weft_port: ?u16,
     extra_args: []const []const u8,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
+    const l = log(.remote_install);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const target = try parse_target(alloc, ssh_target);
-
-    const host = if (weft_host) |h|
-        h
-    else
-        try resolve_host(alloc, io, target.ssh_dest, target.port, target.host);
-
-    const port = weft_port orelse 9338;
+    const target = try parse_target_leaky(alloc, ssh_target);
 
     const exe_path = try std.process.executablePathAlloc(io, alloc);
 
-    term.op("uploading weft binary to {s}...", .{target.ssh_dest});
-    const scp_dst = try std.fmt.allocPrint(alloc, "{s}:/tmp/weft", .{target.ssh_dest});
+    l.info("uploading weft binary to {s}...", .{target.ssh_dest});
+    const scp_dst = try alloc.print("{s}:/tmp/weft", .{target.ssh_dest});
 
     const scp_argv: []const []const u8 = if (target.port) |p|
-        &.{ "scp", "-P", p, exe_path, scp_dst }
+        &.{ "scp", "-o", "RemoteCommand=none", "-o", "RequestTTY=no", "-P", p, exe_path, scp_dst }
     else
-        &.{ "scp", exe_path, scp_dst };
+        &.{ "scp", "-o", "RemoteCommand=none", "-o", "RequestTTY=no", exe_path, scp_dst };
 
     var scp_child = try std.process.spawn(io, .{
         .argv = scp_argv,
@@ -109,183 +117,57 @@ pub fn install(
     });
     const scp_term = try scp_child.wait(io);
     if (scp_term != .exited or scp_term.exited != 0) {
-        term.err("failed to copy binary to remote (exit code {any})", .{scp_term});
+        l.err("failed to copy binary to remote (exit code {any})", .{scp_term});
         return error.ScpFailed;
     }
 
-    term.op("installing weft daemon on {s}...", .{target.ssh_dest});
+    l.info("installing weft daemon on {s}...", .{target.ssh_dest});
     var install_argv: std.ArrayList([]const u8) = .empty;
-    try install_argv.append(alloc, "ssh");
-    if (target.port) |p| {
-        try install_argv.append(alloc, "-p");
-        try install_argv.append(alloc, p);
-    }
-    try install_argv.append(alloc, target.ssh_dest);
-    try install_argv.append(alloc, "sh");
-    try install_argv.append(alloc, "-c");
-
-    const setup_script = try std.fmt.allocPrint(
-        alloc,
-        "cp /tmp/weft /usr/local/bin/weft.new && chmod +x /usr/local/bin/weft.new && mv -f /usr/local/bin/weft.new /usr/local/bin/weft && rm -f /tmp/weft",
-        .{},
-    );
-    try install_argv.append(alloc, setup_script);
+    try install_argv.appendSlice(alloc, &.{ "ssh", "-o", "RemoteCommand=none", "-o", "RequestTTY=no" });
+    if (target.port) |p|
+        try install_argv.appendSlice(alloc, &.{ "-p", p });
+    try install_argv.appendSlice(alloc, &.{
+        target.ssh_dest,
+        "sh -c 'cp /tmp/weft /usr/local/bin/weft.new && chmod +x /usr/local/bin/weft.new && mv -f /usr/local/bin/weft.new /usr/local/bin/weft && rm -f /tmp/weft'",
+    });
 
     const setup_res = try std.process.run(alloc, io, .{
         .argv = install_argv.items,
     });
     if (setup_res.term != .exited or setup_res.term.exited != 0) {
-        term.err("remote setup failed (exit code {any}): {s}", .{ setup_res.term, setup_res.stderr });
+        l.err(
+            "remote setup failed (exit {any}):\nstderr: {s}\nstdout: {s}",
+            .{ setup_res.term, setup_res.stderr, setup_res.stdout },
+        );
         return error.RemoteInstallFailed;
     }
 
+    l.info("running daemon install on {s}...", .{target.ssh_dest});
     var daemon_argv: std.ArrayList([]const u8) = .empty;
-    try daemon_argv.append(alloc, "ssh");
-    if (target.port) |p| {
-        try daemon_argv.append(alloc, "-p");
-        try daemon_argv.append(alloc, p);
-    }
-    try daemon_argv.append(alloc, target.ssh_dest);
-    try daemon_argv.append(alloc, "/usr/local/bin/weft");
-    try daemon_argv.append(alloc, "daemon");
-    try daemon_argv.append(alloc, "install");
+    try daemon_argv.appendSlice(alloc, &.{ "ssh", "-o", "RemoteCommand=none", "-o", "RequestTTY=no" });
+    if (target.port) |p|
+        try daemon_argv.appendSlice(alloc, &.{ "-p", p });
+    try daemon_argv.appendSlice(alloc, &.{
+        target.ssh_dest,
+        "/usr/local/bin/weft",
+        "daemon",
+        "install",
+    });
 
-    for (extra_args) |arg| {
-        try daemon_argv.append(alloc, arg);
-    }
+    try daemon_argv.appendSlice(alloc, extra_args);
 
     const daemon_res = try std.process.run(alloc, io, .{
         .argv = daemon_argv.items,
     });
     if (daemon_res.term != .exited or daemon_res.term.exited != 0) {
-        term.err("remote installation failed (exit code {any}): {s}", .{ daemon_res.term, daemon_res.stderr });
+        l.err(
+            "remote installation failed (exit {any}):\nstderr: {s}\nstdout: {s}",
+            .{ daemon_res.term, daemon_res.stderr, daemon_res.stdout },
+        );
         return error.RemoteInstallFailed;
     }
+    if (daemon_res.stdout.len > 0)
+        l.info("daemon output:\n{s}", .{daemon_res.stdout});
 
-    var token_argv: std.ArrayList([]const u8) = .empty;
-    try token_argv.append(alloc, "ssh");
-    if (target.port) |p| {
-        try token_argv.append(alloc, "-p");
-        try token_argv.append(alloc, p);
-    }
-    try token_argv.append(alloc, target.ssh_dest);
-    try token_argv.append(alloc, "/usr/local/bin/weft");
-    try token_argv.append(alloc, "daemon");
-    try token_argv.append(alloc, "token");
-
-    const token_res = try std.process.run(alloc, io, .{
-        .argv = token_argv.items,
-    });
-    if (token_res.term != .exited or token_res.term.exited != 0) {
-        term.err("remote token fetch failed (exit code {any}): {s}", .{ token_res.term, token_res.stderr });
-        return error.RemoteInstallFailed;
-    }
-
-    const token = std.mem.trim(u8, token_res.stdout, " \n");
-    if (token.len != 32) {
-        term.err("remote token fetch failed, could not parse token from output: '{s}'. ('{s}')", .{ token_res.stdout, token_res.stderr });
-        return error.RemoteInstallFailed;
-    }
-    const existing_remotes = try installation.get_remotes_leaky(alloc, io, term);
-
-    var remotes_list: std.ArrayList(Remote) = .empty;
-    var updated = false;
-
-    for (existing_remotes) |rem| {
-        if (std.mem.eql(u8, rem.get_name(), name)) {
-            try remotes_list.append(alloc, .{
-                .name = try alloc.dupe(u8, name),
-                .address = if (weft_host != null or weft_port != null)
-                    .{ try alloc.dupe(u8, host), port }
-                else
-                    rem.address,
-                .token = try alloc.dupe(u8, token),
-                .groups = rem.groups,
-            });
-            updated = true;
-        } else try remotes_list.append(alloc, rem);
-    }
-
-    if (!updated)
-        try remotes_list.append(alloc, .{
-            .name = try alloc.dupe(u8, name),
-            .address = .{ try alloc.dupe(u8, host), port },
-            .token = try alloc.dupe(u8, token),
-            .groups = &.{},
-        });
-
-    try installation.save_remotes(io, remotes_list.items);
-    term.success("registered remote '{s}' at {s}:{d}", .{
-        name,
-        if (updated) remotes_list.items[remotes_list.items.len - 1].address.@"0" else host,
-        if (updated) remotes_list.items[remotes_list.items.len - 1].address.@"1" else port,
-    });
-}
-
-pub fn list(
-    alloc: std.mem.Allocator,
-    io: std.Io,
-    term: *Term,
-    installation: ClientInstall,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    const remotes = try installation.get_remotes_leaky(arena_alloc, io, term);
-    if (remotes.len == 0) {
-        term.println("No remotes registered in remotes.zon", .{});
-        return;
-    }
-
-    term.println("Registered remotes:", .{});
-    for (remotes) |rem| {
-        const name = rem.get_name();
-        const host = rem.address.@"0";
-        const port = rem.address.@"1";
-        if (rem.groups.len > 0) {
-            var groups_buf: std.ArrayList([]const u8) = .empty;
-            defer groups_buf.deinit(arena_alloc);
-            for (rem.groups) |g| try groups_buf.append(arena_alloc, g);
-            const groups_str = try std.mem.join(arena_alloc, ", ", groups_buf.items);
-            term.print("  ", .{});
-            term.styled(.bold, "{s}", .{name});
-            term.println(" -> {s}:{d} (groups: {s})", .{ host, port, groups_str });
-        } else {
-            term.print("  ", .{});
-            term.styled(.bold, "{s}", .{name});
-            term.println(" -> {s}:{d}", .{ host, port });
-        }
-    }
-}
-
-pub fn remove(
-    alloc: std.mem.Allocator,
-    io: std.Io,
-    term: *Term,
-    installation: ClientInstall,
-    name: []const u8,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    const remotes = try installation.get_remotes_leaky(arena_alloc, io, term);
-    var updated_list: std.ArrayList(Remote) = .empty;
-    defer updated_list.deinit(arena_alloc);
-
-    for (remotes) |rem| {
-        if (std.mem.eql(u8, rem.get_name(), name))
-            break;
-    } else {
-        term.err("remote '{s}' not found in remotes.zon", .{name});
-        return error.RemoteNotFound;
-    }
-
-    for (remotes) |rem|
-        if (!std.mem.eql(u8, rem.get_name(), name))
-            try updated_list.append(arena_alloc, rem);
-
-    try installation.save_remotes(io, updated_list.items);
-    term.success("removed remote '{s}' from remotes.zon", .{name});
+    return try register(gpa, io, installation, ssh_target, null);
 }

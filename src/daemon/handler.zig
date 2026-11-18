@@ -1,26 +1,34 @@
 const std = @import("std");
+const log = std.log.scoped;
 
 const paths = @import("../domain/paths.zig");
 const proto = @import("../domain/proto.zig");
-const Term = @import("../domain/Term.zig");
-const systemd = @import("../util/systemd.zig");
+const format_duration = @import("../util/sizes.zig").format_duration;
 const zoto = @import("../util/zoto.zig");
 const Connection = @import("../wire/Connection.zig");
 const Packer = @import("../wire/Packer.zig");
 const Pressor = @import("../wire/Pressor.zig");
+const clinternal = @import("clinternal.zig");
 const Daemon = @import("Daemon.zig");
 const DaemonInstall = @import("DaemonInstall.zig");
-const gc = @import("gc.zig");
 const Server = @import("Server.zig");
 const Task = @import("Task.zig");
 
+const handlers = struct {
+    const artifact = @import("./handler/artifact.zig");
+    const cache = @import("./handler/cache.zig");
+    const task = @import("./handler/task.zig");
+};
+
 pub fn handle(daemon: *Daemon, permits: *std.Io.Semaphore, stream: std.Io.net.Stream) !void {
+    const l = log(.client_server);
     defer permits.post(daemon.io);
+    errdefer stream.close(daemon.io);
 
     _run(daemon, stream) catch |err| {
-        if (err == error.ReAssigned)
+        if (err == error.ReAssigned or err == error.EndOfStream)
             return;
-        daemon.term.err("worker error: {any}", .{err});
+        l.err("worker error: {any}", .{err});
         if (@errorReturnTrace()) |trace|
             std.debug.dumpErrorReturnTrace(trace);
     };
@@ -29,703 +37,134 @@ pub fn handle(daemon: *Daemon, permits: *std.Io.Semaphore, stream: std.Io.net.St
 }
 
 fn _run(daemon: *Daemon, stream: std.Io.net.Stream) !void {
-    const gpa = daemon.gpa;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
+    const l = log(.client_server);
+    var arena: std.heap.ArenaAllocator = .init(daemon.gpa);
     defer arena.deinit();
+    const alloc = arena.allocator();
 
-    const reader_buf = try gpa.alloc(u8, 4 << 10);
-    defer gpa.free(reader_buf);
-    const writer_buf = try gpa.alloc(u8, 4 << 10);
-    defer gpa.free(writer_buf);
+    const reader_buf = try alloc.alloc(u8, 4 << 10);
+    const writer_buf = try alloc.alloc(u8, 4 << 10);
 
     var reader = stream.reader(daemon.io, reader_buf);
     var writer = stream.writer(daemon.io, writer_buf);
 
-    var conn: Connection = try .init(
-        daemon.io,
-        &try daemon.config.get_secret(),
+    var conn = try daemon.connect(
         &reader.interface,
         &writer.interface,
     );
 
-    const request = request: {
+    const response_buf = try alloc.alloc(u8, 4 << 10);
+
+    while (true) {
         var req_buffer: [1 << 5]u8 = undefined;
-        break :request conn.recv_object_buf(&req_buffer, proto.Request) catch |err|
+        const request = conn.recv_object_buf(&req_buffer, proto.Request) catch |err| {
+            if (err == error.EndOfStream)
+                return;
             return if (err == error.BufferTooSmall)
                 error.InvalidRequest
             else
                 err;
-    };
-
-    const response_buf = try gpa.alloc(u8, Connection.max_packet_size);
-    defer gpa.free(response_buf);
-    switch (request) {
-        .artifact_push => {
-            const res = handle_artifact_push(daemon, &arena, &conn) catch |err| err: {
-                if (@errorReturnTrace()) |trace|
-                    std.debug.dumpErrorReturnTrace(trace);
-                daemon.term.err("daemon::worker::artifact_push {any}", .{err});
-                break :err err;
-            };
-            try conn.send_object(response_buf, @TypeOf(res), res);
-        },
-        .task_spawn => {
-            const res = handle_task_spawn(daemon, &arena, &conn) catch |err| err: {
-                if (@errorReturnTrace()) |trace|
-                    std.debug.dumpErrorReturnTrace(trace);
-                daemon.term.err("daemon::worker::task_spawn {any}", .{err});
-                break :err err;
-            };
-            try conn.send_object(response_buf, @TypeOf(res), res);
-        },
-        .artifact_pull => {
-            const res = handle_artifact_pull(daemon, &arena, &conn) catch |err| err: {
-                if (@errorReturnTrace()) |trace|
-                    std.debug.dumpErrorReturnTrace(trace);
-                daemon.term.err("daemon::worker::artifact_pull {any}", .{err});
-                break :err err;
-            };
-            try conn.send_object(response_buf, @TypeOf(res), res);
-        },
-        .task_poll => {
-            const res = handle_task_poll(daemon, &arena, &conn, response_buf) catch |err| err: {
-                if (@errorReturnTrace()) |trace|
-                    std.debug.dumpErrorReturnTrace(trace);
-                daemon.term.err("daemon::worker::task_poll {any}", .{err});
-                break :err err;
-            };
-            try conn.send_object(response_buf, @TypeOf(res), res);
-        },
-        .artifact_has => {
-            const res = handle_artifact_has(daemon, &arena, &conn) catch |err| err: {
-                if (@errorReturnTrace()) |trace|
-                    std.debug.dumpErrorReturnTrace(trace);
-                daemon.term.err("daemon::worker::artifact_has {any}", .{err});
-                break :err err;
-            };
-            try conn.send_object(response_buf, @TypeOf(res), res);
-        },
-        .system_stats => {
-            const req = try conn.recv_object_buf(response_buf, proto.system.stats.Req);
-            try daemon.stats_server.add_listener(stream, req.from);
-            return error.ReAssigned;
-        },
-        .task_kill => {
-            const res = handle_task_kill(daemon, &arena, &conn) catch |err| err: {
-                if (@errorReturnTrace()) |trace|
-                    std.debug.dumpErrorReturnTrace(trace);
-                daemon.term.err("daemon::worker::task_kill {any}", .{err});
-                break :err err;
-            };
-            try conn.send_object(response_buf, @TypeOf(res), res);
-        },
-        .gc => {
-            const res = handle_gc(daemon, &arena, &conn) catch |err| err: {
-                if (@errorReturnTrace()) |trace|
-                    std.debug.dumpErrorReturnTrace(trace);
-                daemon.term.err("daemon::worker::gc {any}", .{err});
-                break :err err;
-            };
-            try conn.send_object(response_buf, @TypeOf(res), res);
-        },
-    }
-}
-
-fn handle_artifact_has(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Connection) proto.Res(proto.artifact.has.Res) {
-    const ara = arena.allocator();
-    const gpa = daemon.gpa;
-    const io = daemon.io;
-
-    const req = try conn.recv_object(ara, proto.artifact.has.Req);
-    const deployment = req.id.deployment.to_string();
-    const artifact_dir_path = try paths.artifact(
-        gpa,
-        req.id.workspace,
-        &deployment,
-        req.id.pipeline,
-    );
-    defer gpa.free(artifact_dir_path);
-    const has = has: {
-        std.Io.Dir.cwd().access(
-            io,
-            artifact_dir_path,
-            .{},
-        ) catch |err|
-            if (err == error.FileNotFound)
-                break :has false
-            else
-                return err;
-        break :has true;
-    };
-    return .{ .has = has };
-}
-
-fn handle_artifact_pull(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Connection) proto.Res(proto.artifact.pull.Res) {
-    const gpa = daemon.gpa;
-    const io = daemon.io;
-    const ara = arena.allocator();
-    const req = try conn.recv_object(ara, proto.artifact.pull.Req);
-    const id = &req.header.id;
-    const deployment = id.deployment.to_string();
-
-    const artifact_dir = artifact_dir: {
-        const artifact_dir_path = try paths.artifact(
-            gpa,
-            id.workspace,
-            &deployment,
-            id.pipeline,
-        );
-        defer gpa.free(artifact_dir_path);
-        break :artifact_dir std.Io.Dir.cwd().openDir(
-            io,
-            artifact_dir_path,
-            .{ .iterate = true },
-        ) catch |err|
-            return if (err == error.FileNotFound)
-                error.ArtifactNotFound
-            else
-                err;
-    };
-    defer artifact_dir.close(io);
-
-    const file_count = file_count: {
-        var walker = try artifact_dir.walk(gpa);
-        var count: u32 = 0;
-        defer walker.deinit();
-        while (try walker.next(io)) |entry| {
-            if (entry.kind == .file) {
-                count += 1;
-            }
-        }
-        break :file_count count;
-    };
-
-    send_files: {
-        var packer: Packer = try .packer(gpa, artifact_dir);
-        defer packer.deinit(io);
-        const buffer = try gpa.alloc(u8, Pressor.chunk_size + 5);
-        defer gpa.free(buffer);
-
-        try conn.send_object(buffer, proto.artifact.pull.Res, .{ .files = file_count });
-
-        while (try packer.get(io, buffer[5..])) |pack| {
-            @memcpy(buffer[0..4], "pack");
-            switch (pack) {
-                .file => |path| {
-                    buffer[4] = proto.file;
-                    @memcpy(buffer[5 .. 5 + path.len], path);
-                    try conn.send(buffer[0 .. 5 + path.len]);
-                },
-                .folder => |path| {
-                    buffer[4] = proto.folder;
-                    @memcpy(buffer[5 .. 5 + path.len], path);
-                    try conn.send(buffer[0 .. 5 + path.len]);
-                },
-                .data => |data| if (try daemon.pressor.try_acquire()) |pressor| {
-                    defer pressor.release();
-                    var reader: std.Io.Reader = .fixed(data);
-                    if (pressor.compress(&reader)) |compressed| {
-                        if (compressed.len < data.len) {
-                            buffer[4] = proto.compressed_data;
-                            @memcpy(buffer[5 .. 5 + compressed.len], compressed);
-                            try conn.send(buffer[0 .. 5 + compressed.len]);
-                        } else {
-                            buffer[4] = proto.data;
-                            try conn.send(buffer[0 .. 5 + data.len]);
-                        }
-                    } else |_| {
-                        buffer[4] = proto.data;
-                        try conn.send(buffer[0 .. 5 + data.len]);
-                    }
-                } else {
-                    buffer[4] = proto.data;
-                    try conn.send(buffer[0 .. 5 + data.len]);
-                },
-            }
-        }
-
-        @memcpy(buffer[0..4], "pack");
-        buffer[4] = proto.end;
-        try conn.send(buffer[0..5]);
-        break :send_files;
-    }
-
-    return .{ .footer = .{} };
-}
-
-fn handle_artifact_push(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Connection) proto.Res(proto.artifact.push.Res) {
-    const ara = arena.allocator();
-    const gpa = daemon.gpa;
-    const io = daemon.io;
-    var buf: [32]u8 = undefined;
-    const req = switch (try conn.recv_object(ara, proto.artifact.push.Req)) {
-        .header => |h| h,
-        else => return error.ExpectedHeader,
-    };
-    const deployment = req.id.deployment.to_string();
-
-    const artifact_dir_path = try paths.artifact(
-        gpa,
-        req.id.workspace,
-        &deployment,
-        req.id.pipeline,
-    );
-    defer gpa.free(artifact_dir_path);
-
-    const has_artifact = has_artifact: {
-        std.Io.Dir.cwd().access(
-            io,
-            artifact_dir_path,
-            .{},
-        ) catch |err|
-            if (err == error.FileNotFound)
-                break :has_artifact false
-            else
-                return err;
-        break :has_artifact true;
-    };
-    try conn.send_object(&buf, proto.artifact.push.Res, .{ .has_artifact = has_artifact });
-    if (has_artifact)
-        return .{ .footer = .{} };
-
-    const temp_dir_path = receive_artifacts: {
-        var temp_dir = try DaemonInstall.open_temp(io, "artifact");
-        defer temp_dir.close(io);
-
-        var packer: Packer = .unpacker(temp_dir);
-        defer packer.deinit(io);
-
-        var step_arena: std.heap.ArenaAllocator = .init(gpa);
-        defer step_arena.deinit();
-        while (true) : (_ = step_arena.reset(.retain_capacity)) {
-            const raw = try conn.recv_object(step_arena.allocator(), proto.artifact.push.Req);
-            switch (raw) {
-                .folder => |path| {
-                    try packer.put(io, .{ .folder = path });
-                },
-                .file => |path| {
-                    try packer.put(io, .{ .file = path });
-                },
-                .raw => |data| {
-                    try packer.put(io, .{ .data = data });
-                },
-                .data => |data| {
-                    const pressor = try daemon.pressor.acquire();
-                    defer pressor.release();
-                    var reader: std.Io.Reader = .fixed(data);
-                    const output = try pressor.decompress(&reader);
-                    try packer.put(io, .{ .data = output });
-                },
-                .end => break,
-                else => return error.InvalidPack,
-            }
-        }
-        break :receive_artifacts try temp_dir.realPathFileAlloc(io, ".", gpa);
-    };
-    defer gpa.free(temp_dir_path);
-
-    if (std.fs.path.dirname(artifact_dir_path)) |parent|
-        std.Io.Dir.cwd().createDirPath(io, parent) catch {};
-
-    try std.Io.Dir.cwd().rename(
-        temp_dir_path,
-        std.Io.Dir.cwd(),
-        artifact_dir_path,
-        io,
-    );
-    return .{ .footer = .{} };
-}
-
-fn handle_task_spawn(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Connection) proto.Res(proto.task.spawn.Res) {
-    const alloc = arena.allocator();
-    const gpa = daemon.gpa;
-    const io = daemon.io;
-
-    const req = try conn.recv_object(alloc, proto.task.spawn.Req);
-    const spec = req.spec;
-
-    const task: Task = .{ .id = spec.task_id };
-
-    const deployment = task.id.deployment.to_string();
-
-    const input_dirs = input_dirs: {
-        const input_dirs = try alloc.alloc(
-            []const u8,
-            spec.inputs.len,
-        );
-        for (spec.inputs, input_dirs) |input, *input_dir| {
-            const path = try paths.artifact(
-                alloc,
-                spec.task_id.workspace,
-                &deployment,
-                input,
-            );
-            std.Io.Dir.cwd().access(
-                daemon.io,
-                path,
-                .{},
-            ) catch |err|
-                if (err == error.FileNotFound)
-                    return error.MissingInputArtifact;
-
-            input_dir.* = path;
-        }
-        break :input_dirs input_dirs;
-    };
-
-    const archive_dir_path = try task.archive(alloc);
-    try std.Io.Dir.cwd().createDirPath(daemon.io, archive_dir_path);
-    const log_path = try std.fs.path.join(alloc, &.{ archive_dir_path, "log.txt" });
-    var log_file: ?std.Io.File = try std.Io.Dir.cwd().createFile(daemon.io, log_path, .{ .truncate = false });
-    errdefer if (log_file) |f|
-        f.close(io);
-
-    // vehement leak, but it's just a few bytes
-    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] Installing packages\n", .{}));
-    for (spec.pkgs) |basename| {
-        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] intalling {s}...\n", .{basename}));
-        daemon.store.fetch(io, basename) catch |err| {
-            try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] failed to fetch {s}: {s}\n", .{ basename, @errorName(err) }));
-            return err;
-        };
-        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] installed {s}\n", .{basename}));
-    }
-    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::pkg] done\n", .{}));
-    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] setting up environment\n", .{}));
-
-    const run_dir_path = try task.run_dir_path(alloc);
-
-    try std.Io.Dir.cwd().createDirPath(daemon.io, run_dir_path);
-
-    const cwd_dir_path = try std.fs.path.join(alloc, &.{ run_dir_path, "cwd" });
-    try std.Io.Dir.cwd().createDirPath(daemon.io, cwd_dir_path);
-
-    const script_path = try std.fs.path.join(alloc, &.{ run_dir_path, "bin" });
-
-    {
-        const script_file = try std.Io.Dir.cwd().createFile(daemon.io, script_path, .{
-            .permissions = .executable_file,
-        });
-        defer script_file.close(io);
-        try script_file.writeStreamingAll(io, spec.script);
-    }
-
-    const runner_user = daemon.config.runner_user orelse "weft-runner";
-    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] running task as {s}\n", .{runner_user}));
-    const is_default_runner = std.mem.eql(u8, runner_user, "weft-runner");
-
-    const home_dir_path = if (is_default_runner)
-        try paths.home(alloc, spec.task_id.workspace)
-    else
-        try std.fmt.allocPrint(alloc, "/home/{s}", .{runner_user});
-
-    if (is_default_runner)
-        try std.Io.Dir.cwd().createDirPath(daemon.io, home_dir_path);
-
-    const output_dir_path = try std.fs.path.join(alloc, &.{ run_dir_path, "out" });
-
-    var state_dirs: std.ArrayList([]const u8) = try .initCapacity(alloc, spec.outputs.len + 2);
-    try state_dirs.append(alloc, paths.state_dir(cwd_dir_path));
-    if (is_default_runner)
-        try state_dirs.append(alloc, paths.state_dir(home_dir_path));
-
-    for (spec.outputs) |output| {
-        const path = try std.fs.path.join(alloc, &.{
-            output_dir_path,
-            output,
-        });
-        try std.Io.Dir.cwd().createDirPath(daemon.io, path);
-        try state_dirs.append(alloc, paths.state_dir(path));
-    }
-    const unit_name = try task.unit_name(alloc);
-    var bind_paths: std.ArrayList([]const u8) = .empty;
-    var bind_paths_read: std.ArrayList([]const u8) = .empty;
-
-    if (spec.pkgs.len > 0) {
-        try bind_paths_read.append(alloc, "/var/lib/weft/store:/nix/store");
-        try bind_paths_read.append(alloc, "/var/lib/weft/store");
-    }
-
-    for (spec.keep) |keep| {
-        const cache_path = try task.keep_path(alloc, keep.@"0");
-        const mount_path = try std.fs.path.join(gpa, &.{ cwd_dir_path, keep.@"1" });
-        defer gpa.free(mount_path);
-
-        try std.Io.Dir.cwd().createDirPath(io, cache_path);
-        try std.Io.Dir.cwd().createDirPath(io, mount_path);
-        try state_dirs.append(alloc, paths.state_dir(cache_path));
-        try bind_paths.append(
-            alloc,
-            try std.fmt.allocPrint(alloc, "{s}:{s}", .{ cache_path, mount_path }),
-        );
-    }
-
-    const env = bind_env: {
-        var env: std.ArrayList([]const u8) = .empty;
-        const input_dir = try paths.artifacts(
-            alloc,
-            spec.task_id.workspace,
-            &deployment,
-        );
-        try env.append(alloc, try std.fmt.allocPrint(alloc, "IN={s}", .{input_dir}));
-        try env.append(alloc, try std.fmt.allocPrint(alloc, "OUT={s}", .{output_dir_path}));
-        try env.append(alloc, try std.mem.join(alloc, "=", &.{ "HOME", home_dir_path }));
-        try env.append(alloc, try std.mem.join(alloc, "=", &.{ "USER", runner_user }));
-        try env.append(alloc, try std.mem.join(alloc, "=", &.{ "LOGNAME", runner_user }));
-
-        if (spec.pkgs.len > 0) {
-            var pkg_bin_paths: std.ArrayList([]const u8) = .empty;
-            for (spec.pkgs) |basename| {
-                const bin_dir = try std.fmt.allocPrint(alloc, "/nix/store/{s}/bin", .{basename});
-                try pkg_bin_paths.append(alloc, bin_dir);
-            }
-            const joined_bins = try std.mem.join(alloc, ":", pkg_bin_paths.items);
-            try env.append(alloc, try std.fmt.allocPrint(alloc, "PATH={s}:/usr/local/bin:/usr/bin:/bin", .{joined_bins}));
-        }
-
-        for (spec.vars) |pair|
-            try env.append(alloc, try std.mem.join(alloc, "=", &.{ pair.@"0", pair.@"1" }));
-        break :bind_env env;
-    };
-
-    handle_siblings: {
-        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] handling sibling instances(second_instance = {any})\n", .{spec.sibling}));
-        const do_sibling = spec.sibling;
-        if (do_sibling.poll <= 0)
-            return error.InvalidSiblingConfig;
-
-        var waited: u32 = 0;
-        while (waited < do_sibling.wait) : (waited += do_sibling.poll) {
-            var sibling_iter = try task.siblings(
-                gpa,
-                daemon.io,
-                false,
-            );
-            defer sibling_iter.deinit(daemon.io);
-            while (try sibling_iter.next(daemon.io)) |_|
-                break
-            else
-                break;
-            try std.Io.sleep(daemon.io, .fromSeconds(do_sibling.poll), .awake);
-        }
-
-        switch (spec.sibling.then) {
-            .ignore => {},
-            .kill => {
-                var siblings = try task.siblings(gpa, daemon.io, false);
-                defer siblings.deinit(daemon.io);
-                while (try siblings.next(io)) |sibling|
-                    if (try sibling.is_active(gpa, io)) {
-                        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] killing sibling task from {s}\n", .{&sibling.id.deployment.to_string()}));
-                        try sibling.kill(gpa, io);
-                    };
-            },
-            .fail => {
-                var siblings = try task.siblings(gpa, daemon.io, false);
-                defer siblings.deinit(daemon.io);
-                while (try siblings.next(io)) |sibling|
-                    if (try sibling.is_active(gpa, io)) {
-                        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] found sibling {s}; failing\n", .{&sibling.id.deployment.to_string()}));
-                        return error.AlreadyRunning;
-                    };
-            },
-        }
-        try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] Spawning systemd-run for task {s} \n", .{unit_name}));
-        break :handle_siblings;
-    }
-
-    log_file.?.close(io);
-    log_file = null;
-    var child = try systemd.run(
-        gpa,
-        io,
-        unit_name,
-        .{
-            .cmd = &.{script_path},
-            .raw = &.{},
-            .unit = .{
-                .type = .exec,
-                .description = try std.fmt.allocPrint(alloc, "Weft runner", .{}),
-            },
-            .fs = .{
-                .inaccessible = &.{},
-                .private_tmp = true,
-                .protect_system = .strict,
-                .read = input_dirs,
-                .write = &.{},
-                .root_image = null,
-                .tmpfs = &.{},
-                .bind_paths = bind_paths.items,
-                .bind_paths_read = bind_paths_read.items,
-            },
-            .permissions = .{
-                .capability_bounding_set = &.{},
-                .protect_control_groups = true,
-                .private_devices = true,
-                .protect_kernel_modules = true,
-                .protect_kernel_tunables = true,
-                .private_network = spec.tune.disable_network,
-                .no_new_privileges = true,
-            },
-            .run = .{
-                .user = runner_user,
-                .group = null,
-                .wait = false,
-                .collect = true,
-                .cwd = cwd_dir_path,
-                .dynamic_user = false,
-                .state_directories = state_dirs.items,
-                .env = env.items,
-                .hooks = .{
-                    .poststart = try std.fmt.allocPrint(alloc, "+/usr/bin/touch {s}/started", .{run_dir_path}),
-                    .poststop = try std.fmt.allocPrint(
-                        alloc,
-                        "+/usr/local/bin/weft daemon ipc completed {s} $EXIT_STATUS",
-                        .{unit_name},
-                    ),
-                },
-                .stderr = .{ .append = log_path },
-                .stdout = .{ .append = log_path },
-            },
-            .resources = .{
-                .memory_max = spec.tune.memory_max,
-                .memory_high = spec.tune.memory_high,
-                .cpu_quota = spec.tune.cpu_quota,
-                .tasks_max = spec.tune.tasks_max,
-                .io_weight = spec.tune.io_weight,
-                .timeout = spec.tune.timeout,
-            },
-        },
-    );
-    const term = try child.wait(daemon.io);
-    try log_file.?.writeStreamingAll(io, try std.fmt.allocPrint(alloc, "[weft::spawner] exited with: {any} \n", .{term}));
-    if (term.exited != 0) {
-        daemon.term.err("Systemd task launch failed: {any}", .{term});
-        return error.SpawnFailed;
-    } else return .{};
-}
-
-const max_log_pack_size = 32 << 10;
-pub fn handle_task_poll(
-    daemon: *Daemon,
-    arena: *std.heap.ArenaAllocator,
-    conn: *Connection,
-    response_buf: []u8,
-) proto.Res(proto.task.poll.Res) {
-    const cwd = std.Io.Dir.cwd();
-    const ara = arena.allocator();
-    const gpa = daemon.gpa;
-    const io = daemon.io;
-    const req = (try conn.recv_object(ara, proto.task.poll.Req)).header;
-
-    for (req.tasks) |item_req| {
-        const task: Task = .{ .id = item_req.task };
-
-        const archive_dir_path = task.archive(ara) catch |err| return err;
-
-        var archive_dir = cwd.openDir(io, archive_dir_path, .{}) catch |err| {
-            if (err == error.FileNotFound) {
-                try conn.send_object(response_buf, proto.Res(proto.task.poll.Res), .{
-                    .item = .{
-                        .task = item_req.task,
-                        .logs = null,
-                        .status = .not_found,
-                        .usage = null,
-                    },
-                });
-                continue;
-            } else return err;
-        };
-        defer archive_dir.close(io);
-
-        const status: ?u16 = status: {
-            var buf: [2]u8 = undefined;
-            const file = archive_dir.openFile(io, "status", .{ .allow_directory = false }) catch |err| {
-                if (err == error.FileNotFound)
-                    break :status null
-                else
-                    return err;
-            };
-            defer file.close(io);
-            const s = try file.readStreaming(io, &.{&buf});
-            if (s < 2)
-                break :status null;
-            break :status std.mem.readInt(u16, &buf, .little);
         };
 
-        const logs: ?proto.task.poll.Logs = if (item_req.logs_offset) |offset| read_logs: {
-            const logs_file = archive_dir.openFile(
-                io,
-                "log.txt",
-                .{ .allow_directory = false },
-            ) catch |err| {
-                if (err == error.FileNotFound)
-                    break :read_logs null
-                else
-                    return err;
-            };
-            defer logs_file.close(io);
+        const t_start = std.Io.Clock.now(.real, daemon.io);
+        if (request != .task_poll)
+            l.debug("request: {any}", .{request});
 
-            const size = try logs_file.length(io);
-            if (size <= offset)
-                break :read_logs .{
-                    .data = &.{},
-                    .compressed = false,
-                    .end_offset = size,
+        switch (request) {
+            .artifact_push => {
+                const res = handlers.artifact.push(daemon, &conn) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("artifact_push failed: {any}", .{err});
+                    break :err err;
                 };
-
-            const to_read = @min(size - offset, max_log_pack_size);
-            const buff = try ara.alloc(u8, to_read);
-
-            _ = try logs_file.readPositionalAll(io, buff, offset);
-            break :read_logs .{
-                .data = buff,
-                .compressed = false,
-                .end_offset = offset + to_read,
-            };
-        } else null;
-
-        const usage: ?proto.task.poll.TaskUsage = if (status == null) task.usage(gpa, io) else null;
-
-        try conn.send_object(response_buf, proto.Res(proto.task.poll.Res), .{
-            .item = .{
-                .task = item_req.task,
-                .logs = logs,
-                .status = if (status) |code|
-                    if (code == 0)
-                        .success
-                    else
-                        .{ .failed = code }
-                else
-                    .running,
-                .usage = usage,
+                try conn.send_object(response_buf, @TypeOf(res), res);
             },
-        });
+            .task_spawn => {
+                const res = handlers.task.spawn(daemon, &conn) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("task_spawn failed: {any}", .{err});
+                    break :err err;
+                };
+                try conn.send_object(response_buf, @TypeOf(res), res);
+            },
+            .artifact_pull => {
+                const res = handlers.artifact.pull(daemon, &conn) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("artifact_pull failed: {any}", .{err});
+                    break :err err;
+                };
+                try conn.send_object(response_buf, @TypeOf(res), res);
+            },
+            .task_poll => {
+                const res = handlers.task.poll(daemon, &conn, response_buf) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("task_poll failed: {any}", .{err});
+                    break :err err;
+                };
+                try conn.send_object(response_buf, @TypeOf(res), res);
+            },
+            .artifact_has => {
+                const res = handlers.artifact.has(daemon, &conn) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("artifact_has failed: {any}", .{err});
+                    break :err err;
+                };
+                try conn.send_object(response_buf, @TypeOf(res), res);
+            },
+            .cache_push => {
+                const res = handlers.cache.push(daemon, &conn) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("cache_push failed: {any}", .{err});
+                    break :err err;
+                };
+                try conn.send_object(response_buf, @TypeOf(res), res);
+            },
+            .cache_pull => {
+                const res = handlers.cache.pull(daemon, &conn) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("cache_pull failed: {any}", .{err});
+                    break :err err;
+                };
+                try conn.send_object(response_buf, @TypeOf(res), res);
+            },
+            .cache_has => {
+                const res = handlers.cache.has(daemon, &conn) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("cache_has failed: {any}", .{err});
+                    break :err err;
+                };
+                try conn.send_object(response_buf, @TypeOf(res), res);
+            },
+            .system_stats => {
+                const req = try conn.recv_object_buf(response_buf, proto.system.stats.Req);
+                try daemon.stats_server.add_listener(stream, req.from);
+                return error.ReAssigned;
+            },
+            .task_kill => {
+                const res = handlers.task.kill(daemon, &conn) catch |err| err: {
+                    if (@errorReturnTrace()) |trace|
+                        std.debug.dumpErrorReturnTrace(trace);
+                    l.err("task_kill failed: {any}", .{err});
+                    break :err err;
+                };
+                try conn.send_object(response_buf, @TypeOf(res), res);
+            },
+        }
+
+        if (request != .system_stats) {
+            const t_end = std.Io.Clock.now(.real, daemon.io);
+            const dur = t_start.durationTo(t_end);
+            var dur_buf: [32]u8 = undefined;
+            if (request != .task_poll)
+                l.info("{s} handled in {s}", .{ @tagName(request), format_duration(&dur_buf, dur.nanoseconds) });
+        }
     }
-
-    return .{ .footer = .{} };
-}
-
-fn handle_task_kill(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Connection) proto.Res(proto.task.kill.Res) {
-    const ara = arena.allocator();
-    const io = daemon.io;
-
-    const req = try conn.recv_object(ara, proto.task.kill.Req);
-    const killed_count = try Task.kill_matching(ara, io, req);
-    return .{ .killed_count = killed_count };
-}
-
-fn handle_gc(daemon: *Daemon, arena: *std.heap.ArenaAllocator, conn: *Connection) proto.Res(proto.gc.Res) {
-    const ara = arena.allocator();
-    const req = try conn.recv_object(ara, proto.gc.Req);
-    const res = try gc.run(daemon.gpa, daemon.io, daemon.term, .{
-        .workspace = req.workspace,
-        .keep = req.keep,
-        .older_than_ms = req.older_than_ms,
-        .dry_run = req.dry_run,
-    });
-    return .{
-        .deployments_removed = res.deployments_removed,
-        .bytes_freed = res.bytes_freed,
-    };
 }

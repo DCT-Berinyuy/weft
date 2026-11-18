@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// TODO: Improve error reporting. With diagnostics and help
 pub const ArgzParseError = error{
     ExpectedCommand,
     InvalidCommand,
@@ -13,13 +12,20 @@ pub const ArgzParseError = error{
 };
 
 fn flag_matches(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        const norm_a = if (ca == '-') '_' else ca;
-        const norm_b = if (cb == '-') '_' else cb;
-        if (norm_a != norm_b) return false;
-    }
-    return true;
+    if (a.len != b.len)
+        return false;
+    return for (a, b) |ca, cb| {
+        const norm_a = if (ca == '-')
+            '_'
+        else
+            ca;
+        const norm_b = if (cb == '-')
+            '_'
+        else
+            cb;
+        if (norm_a != norm_b)
+            break false;
+    } else true;
 }
 
 pub const Args = struct {
@@ -34,23 +40,26 @@ pub const Args = struct {
         @memset(self_args, null);
         errdefer alloc.free(self_args);
         var skip = false;
+        var positional_only = false;
         for (args, 0..) |raw, i| {
             if (skip) {
                 skip = false;
                 continue;
             }
-            if (is_flag(raw)) {
-                if (is_neg_flag(raw) or i + 1 >= args.len or is_flag(args[i + 1])) {
-                    self_args[i] = .{ .toggle = .{ flag_name(raw), !is_neg_flag(raw) } };
-                } else if (i + 1 <= args.len) {
+            if (!positional_only and std.mem.eql(u8, raw, "--")) {
+                positional_only = true;
+                continue;
+            }
+            if (!positional_only and is_flag(raw)) {
+                if (is_neg_flag(raw) or i + 1 >= args.len or is_flag(args[i + 1]))
+                    self_args[i] = .{ .toggle = .{ flag_name(raw), !is_neg_flag(raw) } }
+                else if (i + 1 <= args.len) {
                     self_args[i] = .{
                         .key_value = .{ flag_name(args[i]), args[i + 1] },
                     };
                     skip = true;
                 } else return ArgzParseError.ExpectedArgument;
-            } else {
-                self_args[i] = .{ .value = raw };
-            }
+            } else self_args[i] = .{ .value = raw };
         }
         return .{
             .args = self_args,
@@ -115,78 +124,49 @@ pub const Args = struct {
     }
 };
 
-pub const Help = struct {
-    pub const doc = "Show help";
-    pub const doc_command = "Document a specific command";
+pub fn Help(comptime name: []const u8, comptime T: anytype) type {
+    return struct {
+        pub const hidden = true;
+        pub const doc = "Show help";
+        pub const doc_command = "Document a specific command";
+        pub const root = T;
 
-    command: []const []const u8 = &.{},
-};
+        command: []const []const u8 = &.{},
 
-fn make_help(comptime HelpType: type, cmd_slice: [][]const u8) HelpType {
-    if (HelpType == void) return {};
-    var h: HelpType = undefined;
-    inline for (@typeInfo(HelpType).@"struct".fields) |f| {
-        if (std.mem.eql(u8, f.name, "command") or std.mem.eql(u8, f.name, "commands") or std.mem.eql(u8, f.name, "item") or std.mem.eql(u8, f.name, "items")) {
-            @field(h, f.name) = cmd_slice;
-        } else if (f.defaultValue()) |def| {
-            @field(h, f.name) = def;
-        } else if (f.type == []const []const u8 or f.type == [][]const u8) {
-            @field(h, f.name) = cmd_slice;
-        } else {
-            @field(h, f.name) = undefined;
+        pub inline fn help(self: @This()) []const u8 {
+            return doc_path(
+                name,
+                root,
+                self.command,
+            );
         }
-    }
-    return h;
-}
-
-fn check_help(args: []const []const u8, alloc: std.mem.Allocator) !?[][]const u8 {
-    var has_help = false;
-    for (args, 0..) |raw, i| {
-        if (std.mem.eql(u8, raw, "--help") or std.mem.eql(u8, raw, "-h") or
-            (std.mem.eql(u8, raw, "help") and (i == 0 or !Args.is_flag(args[i - 1]))))
-        {
-            has_help = true;
-            break;
+        pub inline fn handle(self: @This()) void {
+            std.debug.print("{s}", .{self.help()});
         }
-    }
-    if (!has_help) return null;
-
-    var cmd_count: usize = 0;
-    for (args, 0..) |raw, i| {
-        if (Args.is_flag(raw)) continue;
-        if (i > 0 and Args.is_flag(args[i - 1]) and !Args.is_neg_flag(args[i - 1]) and
-            !std.mem.eql(u8, args[i - 1], "--help") and !std.mem.eql(u8, args[i - 1], "-h"))
-        {
-            continue;
+        pub inline fn init(cmds: []const []const u8) @This() {
+            return .{
+                .command = cmds,
+            };
         }
-        if (std.mem.eql(u8, raw, "help")) continue;
-        cmd_count += 1;
-    }
-
-    const cmds = try alloc.alloc([]const u8, cmd_count);
-    var idx: usize = 0;
-    for (args, 0..) |raw, i| {
-        if (Args.is_flag(raw)) continue;
-        if (i > 0 and Args.is_flag(args[i - 1]) and !Args.is_neg_flag(args[i - 1]) and
-            !std.mem.eql(u8, args[i - 1], "--help") and !std.mem.eql(u8, args[i - 1], "-h"))
-        {
-            continue;
-        }
-        if (std.mem.eql(u8, raw, "help")) continue;
-        if (idx < cmd_count) {
-            cmds[idx] = raw;
-            idx += 1;
-        }
-    }
-    return cmds;
+    };
 }
 
 pub inline fn parse(comptime A: type, alloc: std.mem.Allocator, io: ?std.Io, args: []const []const u8) anyerror!A {
-    if (@typeInfo(A) == .@"union" and @hasField(A, "help")) {
-        if (try check_help(args, alloc)) |cmd_slice| {
-            const HelpType = @FieldType(A, "help");
-            return @unionInit(A, "help", make_help(HelpType, cmd_slice));
-        }
+    if (@typeInfo(A) == .@"union" and @hasField(A, "argz_help")) {
+        const help_cmd = if (args.len > 0 and std.mem.eql(u8, args[0], "help"))
+            args[1..]
+        else for (args, 0..) |raw, i| {
+            if (std.mem.eql(u8, raw, "--"))
+                break null
+            else if (std.mem.eql(u8, raw, "--help") or std.mem.eql(u8, raw, "-h"))
+                break args[0..i];
+        } else null;
+        if (help_cmd) |cmd_slice|
+            return @unionInit(
+                A,
+                "argz_help",
+                @FieldType(A, "argz_help").init(cmd_slice),
+            );
     }
     return switch (@typeInfo(A)) {
         inline .@"union" => try subcmd(A, alloc, io, args),
@@ -198,13 +178,14 @@ fn subcmd(comptime C: type, alloc: std.mem.Allocator, io: ?std.Io, args: []const
     if (args.len < 1)
         return ArgzParseError.ExpectedCommand;
     const a = @typeInfo(C);
+
     return switch (a) {
-        inline .@"union" => |U| inline for (U.fields) |field| {
-            if (flag_matches(field.name, args[0]))
+        inline .@"union" => |U| inline for (U.field_names, U.field_types) |field_name, field_type| {
+            if (flag_matches(field_name, args[0]))
                 break @unionInit(
                     C,
-                    field.name,
-                    try parse(field.type, alloc, io, args[1..]),
+                    field_name,
+                    try parse(field_type, alloc, io, args[1..]),
                 );
         } else if (@hasField(C, "else"))
             @unionInit(
@@ -230,15 +211,15 @@ fn cmdargs(comptime A: type, alloc: std.mem.Allocator, io: ?std.Io, raw_args: []
 
     var obj: A = undefined;
 
-    fields: inline for (S.fields) |field|
-        @field(obj, field.name) = value: {
-            switch (@typeInfo(field.type)) {
+    fields: inline for (S.field_names, S.field_types, S.field_attrs) |field_name, field_type, field_attrs|
+        @field(obj, field_name) = value: {
+            switch (@typeInfo(field_type)) {
                 inline .array => |Ar| {
-                    var arr: field.type = undefined;
+                    var arr: field_type = undefined;
                     if (Ar.len == 0)
                         continue :fields;
                     var idx: usize = 0;
-                    while (args.take_flag(field.name) orelse args.take_positional()) |val| {
+                    while (args.take_flag(field_name) orelse args.take_positional()) |val| {
                         arr[idx] = try parse_value(Ar.child, alloc, io, val);
                         idx += 1;
                         if (idx >= Ar.len)
@@ -248,15 +229,15 @@ fn cmdargs(comptime A: type, alloc: std.mem.Allocator, io: ?std.Io, raw_args: []
                 inline .pointer => |Ptr| switch (Ptr.size) {
                     .slice => {
                         if (Ptr.child == u8) {
-                            break :value if (args.take_flag(field.name) orelse args.take_positional()) |val|
+                            break :value if (args.take_flag(field_name) orelse args.take_positional()) |val|
                                 val
                             else
-                                field.defaultValue() orelse
+                                field_attrs.defaultValue(field_type) orelse
                                     return ArgzParseError.ExpectedArgument;
                         }
                         var list: std.ArrayList(Ptr.child) = .empty;
                         defer list.deinit(alloc);
-                        while (args.take_flag(field.name) orelse args.take_positional()) |val| {
+                        while (args.take_flag(field_name) orelse args.take_positional()) |val| {
                             try list.append(
                                 alloc,
                                 try parse_value(Ptr.child, alloc, io, val),
@@ -267,15 +248,15 @@ fn cmdargs(comptime A: type, alloc: std.mem.Allocator, io: ?std.Io, raw_args: []
                     else => @compileError("Argz only supports slice pointers"),
                 },
                 else => {
-                    break :value if (args.take_flag(field.name) orelse args.take_positional()) |val|
+                    break :value if (args.take_flag(field_name) orelse args.take_positional()) |val|
                         try parse_value(
-                            field.type,
+                            field_type,
                             alloc,
                             io,
                             val,
                         )
                     else
-                        field.defaultValue() orelse
+                        field_attrs.defaultValue(field_type) orelse
                             return ArgzParseError.ExpectedArgument;
                 },
             }
@@ -312,12 +293,10 @@ pub fn parse_value(comptime T: type, alloc: std.mem.Allocator, io: ?std.Io, val:
             ArgzParseError.InvalidArgument,
         inline .float => std.fmt.parseFloat(T, val) catch
             ArgzParseError.InvalidArgument,
-        inline .@"enum" => |E| inline for (E.fields) |field|
+        inline .@"enum" => |E| inline for (E.fields) |field| {
             if (flag_matches(field.name, val))
-                break :a @enumFromInt(field.value)
-            else {}
-        else
-            ArgzParseError.InvalidArgument,
+                break :a @fromBackingInt(@intCast(field.value));
+        } else ArgzParseError.InvalidArgument,
         inline .@"union" => |U| inline for (U.fields) |field| {
             if (std.mem.startsWith(u8, val, field.name ++ ":"))
                 break @unionInit(
@@ -360,6 +339,9 @@ pub const SocketAddr = struct {
             .host = str,
             .port = null,
         };
+    }
+    pub fn ip_address(self: @This()) !std.Io.net.IpAddress {
+        return try .parse(self.host, self.port orelse 0);
     }
 };
 
@@ -404,14 +386,14 @@ pub fn doc(comptime name: []const u8, comptime T: type) []const u8 {
 
             out = out ++ "\nCommands:\n";
 
-            for (U.fields) |field| {
-                if (std.mem.eql(u8, field.name, "else"))
+            for (U.field_names, U.field_types) |field_name, field_type| {
+                if (std.mem.eql(u8, field_name, "else"))
                     continue;
-                if (is_hidden(T, field.name, field.type))
+                if (is_hidden(T, field_name, field_type))
                     continue;
 
-                const desc = docs.docstring_arg(T, field.name) orelse docs.docstring(field.type) orelse "";
-                out = out ++ "  " ++ docs.pad_right(field.name, 18);
+                const desc = docs.docstring_arg(T, field_name) orelse docs.docstring(field_type) orelse "";
+                out = out ++ "  " ++ docs.pad_right(field_name, 18);
                 if (desc.len > 0)
                     out = out ++ desc;
                 out = out ++ "\n";
@@ -467,22 +449,22 @@ const docs = struct {
             ),
         };
 
-        if (S.fields.len == 0)
+        if (S.field_names.len == 0)
             return "";
 
         var out: []const u8 = "";
 
-        for (S.fields) |field| {
-            if (is_hidden(T, field.name, field.type))
+        for (S.field_names, S.field_types, S.field_attrs) |field_name, field_type, field_attrs| {
+            if (is_hidden(T, field_name, field_type))
                 continue;
 
-            var arg_line: []const u8 = field.name;
-            if (field.defaultValue() != null) {
+            var arg_line: []const u8 = field_name;
+            if (field_attrs.defaultValue(field_type) != null)
                 arg_line = arg_line ++ " [default]";
-            }
+
             out = out ++ "  " ++ pad_right(arg_line, 22);
 
-            if (docstring_arg(T, field.name)) |description| {
+            if (docstring_arg(T, field_name)) |description| {
                 out = out ++ description;
             }
 
@@ -531,15 +513,16 @@ const docs = struct {
     }
 };
 
-pub fn doc_command(comptime prog_name: []const u8, comptime T: type, path: []const []const u8) []const u8 {
-    if (path.len == 0) return doc(prog_name, T);
+pub fn doc_path(comptime prog_name: []const u8, comptime T: type, path: []const []const u8) []const u8 {
+    if (path.len == 0)
+        return doc(prog_name, T);
     switch (@typeInfo(T)) {
         .@"union" => |U| {
-            inline for (U.fields) |field|
-                if (flag_matches(field.name, path[0]))
-                    return doc_command(
-                        if (prog_name.len > 0) prog_name ++ " " ++ field.name else field.name,
-                        field.type,
+            inline for (U.field_names, U.field_types) |field_name, field_type|
+                if (flag_matches(field_name, path[0]))
+                    return doc_path(
+                        if (prog_name.len > 0) prog_name ++ " " ++ field_name else field_name,
+                        field_type,
                         path[1..],
                     );
 
@@ -547,16 +530,4 @@ pub fn doc_command(comptime prog_name: []const u8, comptime T: type, path: []con
         },
         else => return doc(prog_name, T),
     }
-}
-
-pub fn help(comptime prog_name: []const u8, comptime Root: type, cmd: anytype, term: anytype) void {
-    const help_str = doc_command(
-        prog_name,
-        Root,
-        if (@hasField(@TypeOf(cmd), "command")) cmd.command else &.{},
-    );
-    if (comptime std.meta.hasMethod(@TypeOf(term), "print"))
-        term.print("{s}", .{help_str})
-    else
-        term.writeAll(help_str) catch {};
 }

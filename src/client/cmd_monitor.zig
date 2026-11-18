@@ -1,12 +1,16 @@
 const std = @import("std");
+const log = std.log.scoped;
 
 const proto = @import("../domain/proto.zig");
 const Term = @import("../domain/Term.zig");
+const Weft = @import("../domain/Weft.zig");
 const Monitor = @import("../util/Monitor.zig");
 const format_bytes = @import("../util/sizes.zig").format_bytes;
 const zoto = @import("../util/zoto.zig");
+const Identity = @import("../wire/Identity.zig");
 const Client = @import("Client.zig");
 const ClientInstall = @import("ClientInstall.zig");
+const Project = @import("Project.zig");
 const Remote = @import("Remote.zig");
 
 fn format_time_only(buf: *[8]u8, ns: i128) []const u8 {
@@ -28,16 +32,16 @@ fn format_date_only(buf: []u8, ns: i128) []const u8 {
     const md = yd.calculateMonthDay();
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
         yd.year,
-        @intFromEnum(md.month),
+        @backingInt(md.month),
         md.day_index + 1,
     }) catch "----";
 }
 
 fn pad_10(buf: *[10]u8, s: []const u8) []const u8 {
     @memset(buf, ' ');
-    if (s.len >= 10) {
-        @memcpy(buf[0..10], s[0..10]);
-    } else {
+    if (s.len >= 10)
+        @memcpy(buf[0..10], s[0..10])
+    else {
         const left = (10 - s.len) / 2;
         @memcpy(buf[left .. left + s.len], s);
     }
@@ -45,38 +49,37 @@ fn pad_10(buf: *[10]u8, s: []const u8) []const u8 {
 }
 
 fn format_rate(buf: []u8, rate: u64) []const u8 {
-    if (rate == 0) return "0 B/s";
+    if (rate == 0)
+        return "0 B/s";
     var b_buf: [32]u8 = undefined;
-    const b_str = format_bytes(&b_buf, rate);
+    const b_str = format_bytes(&b_buf, rate) catch "...";
     return std.fmt.bufPrint(buf, "{s}/s", .{b_str}) catch "0 B/s";
 }
 
-fn render_cell(term: *Term, cell: *const [10]u8, filled: u8, color: Term.Color) void {
+fn render_cell(term: *Term, cell: *const [10]u8, filled: u8, color: Term.Color) !void {
     if (!term.is_tty) {
-        term.writer().writeAll(cell) catch {};
+        try term.writer().writeAll(cell);
         return;
     }
 
     const fill_count = @min(filled, 10);
-    if (fill_count > 0) {
-        term.set_reverse(true);
-        term.set_color(color);
-        term.writer().writeAll(cell[0..fill_count]) catch {};
-        term.set_reverse(false);
-    }
-    if (fill_count < 10) {
-        term.set_color(.dim);
-        term.writer().writeAll(cell[fill_count..10]) catch {};
-        term.set_color(.reset);
-    } else {
-        term.set_color(.reset);
-    }
+
+    term.set_reverse(true);
+    term.set_color(color);
+    term.writer().writeAll(cell[0..fill_count]) catch {};
+    term.set_reverse(false);
+    term.set_color(.dim);
+    term.writer().writeAll(cell[fill_count..10]) catch {};
+
+    term.set_color(.reset);
 }
 
 fn render_header(term: *Term, date_str: []const u8) void {
-    if (term.is_tty) term.clear_line();
-    term.styled(.dim, "─── {s} ──────────────────────────────────────────────────────────\n", .{date_str});
-    if (term.is_tty) term.clear_line();
+    if (term.is_tty)
+        term.clear_line();
+    term.styled(.dim, "─── {s} ───\n", .{date_str});
+    if (term.is_tty)
+        term.clear_line();
     term.styled(.bold, "   TIME   ", .{});
     term.print("  ", .{});
     term.styled(.bold, "   CPU    ", .{});
@@ -97,57 +100,61 @@ fn render_header(term: *Term, date_str: []const u8) void {
     term.println("", .{});
 }
 
-fn connect(alloc: std.mem.Allocator, io: std.Io, term: *Term, remote: Remote) !*Client {
-    var client = Client.connect(alloc, io, try remote.get_address(), &try remote.get_token()) catch |err| {
-        term.err("failed to connect to daemon on remote '{s}': {any}", .{ remote.get_name(), err });
+fn connect(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    clients: *Client.Manager,
+    remote: Remote,
+    from: std.Io.Timestamp,
+) !*Client.Managed {
+    const l = log(.monitor_connect);
+    var managed = clients.connect_blocking(
+        io,
+        remote.address,
+    ) catch |err| {
+        l.err("failed to connect to daemon on remote '{s}': {any}", .{ remote.name, err });
         return err;
     };
-    errdefer client.destroy(alloc, io);
+    errdefer managed.release(io);
+    const client = managed.inner;
 
-    const req_buf = try alloc.alloc(u8, 256);
-    defer alloc.free(req_buf);
+    const req_buf = try gpa.alloc(u8, 256);
+    defer gpa.free(req_buf);
 
     try client.conn.send_object(req_buf, proto.Request, .system_stats);
     try client.conn.send_object(req_buf, proto.system.stats.Req, .{
-        .from = .{ .nanoseconds = 0 },
+        .from = from,
     });
-    return client;
+    return managed;
 }
 pub fn run(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     io: std.Io,
     term: *Term,
     inst: ClientInstall,
-    spec: ?[]const u8,
+    remote: Remote,
+    env: ?*std.process.Environ.Map,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    const l = log(.monitor);
+    var clients: *Client.Manager = try .create(gpa, inst.identity, env);
+    defer clients.destroy(io);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const remotes = try inst.get_remotes_leaky(alloc, io, term);
-    if (remotes.len == 0) {
-        term.err("no remotes configured. Run 'weft remote install' first.", .{});
-        return error.NoRemotes;
-    }
-
-    const target_remote: *const Remote = if (spec) |name| remote_find: {
-        for (remotes) |*r| {
-            if (std.mem.eql(u8, r.get_name(), name))
-                break :remote_find r;
-        }
-        term.err("remote '{s}' not found in remotes.zon", .{name});
-        return error.InvalidRemote;
-    } else &remotes[0];
-
-    term.info("connecting to remote '{s}' at {s}:{d}...", .{ target_remote.get_name(), target_remote.address.@"0", target_remote.address.@"1" });
-
-    var maybe_client: ?*Client = try connect(alloc, io, term, target_remote.*);
+    var maybe_client: ?*Client.Managed = try connect(
+        gpa,
+        io,
+        clients,
+        remote,
+        .{ .nanoseconds = 0 },
+    );
     defer if (maybe_client) |c|
-        c.destroy(alloc, io);
+        c.release(io);
 
-    term.info("connected. Monitoring '{s}' (Ctrl+C to quit)...", .{target_remote.get_name()});
-
-    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    var frame_arena: std.heap.ArenaAllocator = .init(gpa);
     defer frame_arena.deinit();
 
     var stream_buf = try alloc.alloc(u8, 64 << 10);
@@ -180,22 +187,37 @@ pub fn run(
     var prev_tx_rate: ?u64 = null;
 
     while (true) {
-        const client = if (maybe_client) |c| c else {
-            try std.Io.sleep(io, .fromSeconds(10), .real);
-            maybe_client = connect(alloc, io, term, target_remote.*) catch null;
+        const managed = if (maybe_client) |c|
+            c
+        else {
+            try std.Io.sleep(io, .fromSeconds(5), .real);
+            const from_ts: std.Io.Timestamp = if (prev_time_ns) |pt|
+                .{ .nanoseconds = @intCast(pt + 1) }
+            else
+                .{ .nanoseconds = 0 };
+            maybe_client = connect(
+                gpa,
+                io,
+                clients,
+                remote,
+                from_ts,
+            ) catch null;
             continue;
         };
+        const client = managed.inner;
         var iac = [_][]u8{stream_buf[read_pos..]};
-        const n = client.conn.reader.readVec(&iac) catch |err| {
-            if (err == error.EndOfStream) {
-                alloc.destroy(client);
-                maybe_client = null;
-                continue;
-            }
-            break;
+        const n = client.conn.reader.readVec(&iac) catch {
+            managed.release(io);
+            maybe_client = null;
+            read_pos = 0;
+            continue;
         };
-        if (n == 0)
-            break;
+        if (n == 0) {
+            managed.release(io);
+            maybe_client = null;
+            read_pos = 0;
+            continue;
+        }
         read_pos += n;
 
         var slice: []const u8 = stream_buf[0..read_pos];
@@ -203,7 +225,7 @@ pub fn run(
             var parse_slice = slice;
             const stats = zoto.deserialize(frame_arena.allocator(), &parse_slice, Monitor.Stats, .{ .header = true, .hash = true }) catch |err| {
                 if (err == error.BufferTooSmall or err == error.EndOfStream) break;
-                term.err("failed to decode stats packet: {any}", .{err});
+                l.err("failed to decode stats packet: {any}", .{err});
                 try std.Io.sleep(io, .fromSeconds(2), .real);
                 return err;
             };
@@ -218,17 +240,17 @@ pub fn run(
 
             if (is_first_sample) {
                 var ram_t_buf: [32]u8 = undefined;
-                const ram_t_str = format_bytes(&ram_t_buf, stats.ram.total);
+                const ram_t_str = format_bytes(&ram_t_buf, stats.ram.total) catch "...";
                 var ram_a_buf: [32]u8 = undefined;
-                const ram_a_str = format_bytes(&ram_a_buf, stats.ram.avail);
+                const ram_a_str = format_bytes(&ram_a_buf, stats.ram.avail) catch "...";
                 var swp_t_buf: [32]u8 = undefined;
-                const swp_t_str = format_bytes(&swp_t_buf, stats.swap.total);
+                const swp_t_str = format_bytes(&swp_t_buf, stats.swap.total) catch "...";
                 var disk_t_buf: [32]u8 = undefined;
-                const disk_t_str = format_bytes(&disk_t_buf, stats.disk.total);
+                const disk_t_str = format_bytes(&disk_t_buf, stats.disk.total) catch "...";
 
                 if (term.is_tty) term.clear_line();
                 term.styled(.bold, "remote: ", .{});
-                term.styled(.cyan, "{s}", .{target_remote.get_name()});
+                term.styled(.cyan, "{s}", .{remote.name});
                 term.styled(.dim, "   cpu: ", .{});
                 term.print("{s} ({d}@{d}MHz)", .{ stats.cpu.model, stats.cpu.cores, stats.cpu.freq });
                 term.styled(.dim, "   ram: ", .{});
@@ -292,21 +314,20 @@ pub fn run(
             const cpu_filled: u8 = @min(10, @as(u8, @intCast((@as(u16, stats.cpu.usage) * 10 + 50) / 100)));
             const cpu_color: Term.Color = if (prev_cpu) |pc| color_select: {
                 const delta: i16 = @as(i16, stats.cpu.usage) - @as(i16, pc);
-                if (delta >= 25) {
-                    break :color_select .bright_red;
-                } else if (delta >= 5) {
-                    break :color_select .yellow;
-                } else if (delta <= -25) {
-                    break :color_select .bright_cyan;
-                } else if (delta <= -5) {
-                    break :color_select .cyan;
-                } else {
-                    break :color_select .green;
-                }
+                break :color_select if (delta >= 25)
+                    .bright_red
+                else if (delta >= 5)
+                    .yellow
+                else if (delta <= -25)
+                    .bright_cyan
+                else if (delta <= -5)
+                    .cyan
+                else
+                    .green;
             } else .green;
 
             var ram_raw_buf: [32]u8 = undefined;
-            const ram_raw_str = format_bytes(&ram_raw_buf, stats.ram.used);
+            const ram_raw_str = format_bytes(&ram_raw_buf, stats.ram.used) catch "...";
             var ram_cell: [10]u8 = undefined;
             _ = pad_10(&ram_cell, ram_raw_str);
             const ram_pct: u64 = if (stats.ram.total > 0) (stats.ram.used * 100) / stats.ram.total else 0;
@@ -328,31 +349,26 @@ pub fn run(
             var swap_color: Term.Color = .dim;
             if (stats.swap.total > 0) {
                 var swap_raw_buf: [32]u8 = undefined;
-                const swap_raw_str = format_bytes(&swap_raw_buf, stats.swap.used);
+                const swap_raw_str = format_bytes(&swap_raw_buf, stats.swap.used) catch "...";
                 _ = pad_10(&swap_cell, swap_raw_str);
                 const swap_pct = (stats.swap.used * 100) / stats.swap.total;
                 swap_filled = @min(10, @as(u8, @intCast((swap_pct * 10 + 50) / 100)));
-                swap_color = if (prev_swap_used) |ps| color_select: {
-                    const delta_bytes: i128 = @as(i128, stats.swap.used) - @as(i128, ps);
-                    if (delta_bytes >= 50 * 1024 * 1024) {
-                        break :color_select .bright_red;
-                    } else if (delta_bytes >= 10 * 1024 * 1024) {
-                        break :color_select .yellow;
-                    } else if (delta_bytes <= -50 * 1024 * 1024) {
-                        break :color_select .bright_cyan;
-                    } else if (delta_bytes <= -10 * 1024 * 1024) {
-                        break :color_select .cyan;
-                    } else {
-                        break :color_select .green;
-                    }
-                } else .green;
-            } else {
-                _ = pad_10(&swap_cell, "-");
-            }
+                const delta_bytes: i128 = if (prev_swap_used) |ps| @as(i128, stats.swap.used) - @as(i128, ps) else 0;
+                swap_color = if (delta_bytes >= 50 * 1024 * 1024)
+                    .bright_red
+                else if (delta_bytes >= 10 * 1024 * 1024)
+                    .yellow
+                else if (delta_bytes <= -50 * 1024 * 1024)
+                    .bright_cyan
+                else if (delta_bytes <= -10 * 1024 * 1024)
+                    .cyan
+                else
+                    .green;
+            } else _ = pad_10(&swap_cell, "-");
 
             var disk_cell: [10]u8 = undefined;
             var disk_raw_buf: [32]u8 = undefined;
-            const disk_raw_str = format_bytes(&disk_raw_buf, stats.disk.used);
+            const disk_raw_str = format_bytes(&disk_raw_buf, stats.disk.used) catch "...";
             _ = pad_10(&disk_cell, disk_raw_str);
             const disk_pct: u64 = if (stats.disk.total > 0) (stats.disk.used * 100) / stats.disk.total else 0;
             const disk_filled: u8 = @min(10, @as(u8, @intCast((disk_pct * 10 + 50) / 100)));
@@ -458,21 +474,21 @@ pub fn run(
             if (term.is_tty) term.clear_line();
             term.styled(.dim, "{s}", .{time_cell});
             term.print("  ", .{});
-            render_cell(term, &cpu_cell, cpu_filled, cpu_color);
+            try render_cell(term, &cpu_cell, cpu_filled, cpu_color);
             term.print("  ", .{});
-            render_cell(term, &ram_cell, ram_filled, ram_color);
+            try render_cell(term, &ram_cell, ram_filled, ram_color);
             term.print("  ", .{});
-            render_cell(term, &swap_cell, swap_filled, swap_color);
+            try render_cell(term, &swap_cell, swap_filled, swap_color);
             term.print("  ", .{});
-            render_cell(term, &disk_cell, disk_filled, disk_color);
+            try render_cell(term, &disk_cell, disk_filled, disk_color);
             term.print("  ", .{});
-            render_cell(term, &drx_cell, drx_filled, drx_color);
+            try render_cell(term, &drx_cell, drx_filled, drx_color);
             term.print("  ", .{});
-            render_cell(term, &dtx_cell, dtx_filled, dtx_color);
+            try render_cell(term, &dtx_cell, dtx_filled, dtx_color);
             term.print("  ", .{});
-            render_cell(term, &rx_cell, rx_filled, rx_color);
+            try render_cell(term, &rx_cell, rx_filled, rx_color);
             term.print("  ", .{});
-            render_cell(term, &tx_cell, tx_filled, tx_color);
+            try render_cell(term, &tx_cell, tx_filled, tx_color);
             term.println("", .{});
             lines_since_header += 1;
 
@@ -497,14 +513,14 @@ pub fn run(
                 var ram_u_buf: [32]u8 = undefined;
                 var ram_t_buf: [32]u8 = undefined;
                 var ram_a_buf: [32]u8 = undefined;
-                const ram_u_str = format_bytes(&ram_u_buf, stats.ram.used);
-                const ram_t_str = format_bytes(&ram_t_buf, stats.ram.total);
-                const ram_a_str = format_bytes(&ram_a_buf, stats.ram.avail);
+                const ram_u_str = format_bytes(&ram_u_buf, stats.ram.used) catch "...";
+                const ram_t_str = format_bytes(&ram_t_buf, stats.ram.total) catch "...";
+                const ram_a_str = format_bytes(&ram_a_buf, stats.ram.avail) catch "...";
 
                 var disk_u_buf: [32]u8 = undefined;
                 var disk_t_buf: [32]u8 = undefined;
-                const disk_u_str = format_bytes(&disk_u_buf, stats.disk.used);
-                const disk_t_str = format_bytes(&disk_t_buf, stats.disk.total);
+                const disk_u_str = format_bytes(&disk_u_buf, stats.disk.used) catch "...";
+                const disk_t_str = format_bytes(&disk_t_buf, stats.disk.total) catch "...";
 
                 term.clear_line();
                 term.styled(.dim, "cpu: ", .{});
@@ -527,8 +543,8 @@ pub fn run(
                 if (stats.swap.total > 0) {
                     var swp_u_buf: [32]u8 = undefined;
                     var swp_t_buf: [32]u8 = undefined;
-                    const swp_u_str = format_bytes(&swp_u_buf, stats.swap.used);
-                    const swp_t_str = format_bytes(&swp_t_buf, stats.swap.total);
+                    const swp_u_str = format_bytes(&swp_u_buf, stats.swap.used) catch "...";
+                    const swp_t_str = format_bytes(&swp_t_buf, stats.swap.total) catch "...";
                     term.styled(.dim, "   swap: ", .{});
                     term.print("{s}/{s}", .{ swp_u_str, swp_t_str });
                 }
@@ -539,17 +555,17 @@ pub fn run(
 
                 if (stats.services.len == 0) {
                     term.clear_line();
-                    term.styled_ln(.dim, "  (no active tasks on {s})", .{target_remote.get_name()});
+                    term.styled_ln(.dim, "  (no active tasks on {s})", .{remote.name});
                     lines_count += 1;
                 } else {
                     for (stats.services) |svc| {
                         var mem_buf: [32]u8 = undefined;
                         var peak_buf: [32]u8 = undefined;
-                        const mem_str = format_bytes(&mem_buf, svc.memory_bytes);
-                        const peak_str = format_bytes(&peak_buf, svc.memory_peak_bytes);
+                        const mem_str = format_bytes(&mem_buf, svc.memory_bytes) catch "...";
+                        const peak_str = format_bytes(&peak_buf, svc.memory_peak_bytes) catch "...";
                         const cpu_ms = svc.cpu_usage_usec / 1000;
 
-                        const task_key = try std.fmt.allocPrint(frame_arena.allocator(), "{s}.{s}", .{ svc.task.id.workspace, svc.task.id.pipeline });
+                        const task_key = try frame_arena.allocator().print("{s}.{s}", .{ svc.task.id.workspace, svc.task.id.pipeline });
                         const color = Term.task_color(task_key);
 
                         term.clear_line();

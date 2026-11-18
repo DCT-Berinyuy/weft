@@ -11,7 +11,7 @@ const src = @import("src.zig");
 const Step = @import("Step.zig");
 
 pub fn run(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     io: std.Io,
     term: *Term,
     project: Project,
@@ -19,28 +19,26 @@ pub fn run(
     do: union(enum) {
         start: struct {
             targets: []const Step,
-            extra_env: [][]const u8 = &.{},
         },
         retry: Deployment.Id,
     },
+    env: ?*std.process.Environ.Map,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var alloc = arena.allocator();
 
     var deployment = switch (do) {
         .start => |start| blk: {
             const owned_targets = try alloc.dupe(Step, start.targets);
-            const config = try project.get_config(alloc, term, io);
-            const deployment = try Deployment.init(io, config, owned_targets, start.extra_env);
-            try deployment.save(alloc, io, project);
+            const config = try project.get_config_leaky(alloc, io);
+            const deployment = try Deployment.init(io, config, owned_targets);
+            try deployment.save(io, project);
             break :blk deployment;
         },
         .retry => |id| blk: {
-            var deployment = try project.load_deployment(alloc, io, id);
-            if (project.get_config(alloc, term, io)) |config| {
-                deployment.config = config;
-            } else |_| {}
+            var deployment = try project.load_deployment_leaky(gpa, alloc, io, id);
+            deployment.config = try project.get_config_leaky(alloc, io);
             break :blk deployment;
         },
     };
@@ -61,5 +59,6 @@ pub fn run(
         project,
         inst,
         &deployment,
+        env,
     );
 }

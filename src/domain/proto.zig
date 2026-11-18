@@ -9,28 +9,34 @@ pub fn Res(comptime T: type) type {
     return anyerror!T;
 }
 
+pub const Pack = union(enum(u8)) {
+    pub const Pull = extern struct {
+        can_decompress: bool,
+    };
+    pub const Push = extern struct {
+        compress: bool,
+        total_files: u64,
+    };
+    pull: Pull,
+    push: Push,
+    folder,
+    file,
+    data,
+    compressed_data,
+    end,
+};
+pub const header: u8 = 0x7a;
+
 pub const file: u8 = 0xaa;
 pub const folder: u8 = 0xab;
-
 pub const end: u8 = 0xff;
-
 pub const data: u8 = 0xea;
 pub const compressed_data: u8 = 0xeb;
 
 pub const artifact = struct {
     pub const push = struct {
-        pub const Req = union(enum) {
-            header: struct { id: task.Id },
-            folder: []const u8,
-            file: []const u8,
-            data: []const u8,
-            raw: []const u8,
-            end,
-        };
-        pub const Res = union(enum) {
-            has_artifact: bool,
-            footer: struct {},
-        };
+        pub const Req = struct { id: task.Id };
+        pub const Res = struct {};
     };
     pub const has = struct {
         pub const Req = struct {
@@ -41,17 +47,32 @@ pub const artifact = struct {
         };
     };
     pub const pull = struct {
-        pub const Req = union(enum) {
-            header: struct {
-                id: task.Id,
-            },
+        pub const Req = struct {
+            id: task.Id,
         };
-        pub const Res = union(enum) {
-            files: u32,
-            footer: struct {},
-        };
+        pub const Res = struct {};
     };
     pub const Id = task.Id;
+};
+pub const cache = struct {
+    pub const Id = struct {
+        workspace: []const u8,
+        name: []const u8,
+    };
+    pub const push = struct {
+        pub const Req = struct { id: Id };
+        pub const Res = struct {};
+    };
+    pub const pull = struct {
+        pub const Req = struct { id: Id };
+        pub const Res = struct {};
+    };
+    pub const has = struct {
+        pub const Req = struct { id: Id };
+        pub const Res = struct {
+            has: bool,
+        };
+    };
 };
 pub const task = struct {
     pub const Id = struct {
@@ -73,6 +94,24 @@ pub const task = struct {
             alloc.free(self.workspace);
             alloc.free(self.pipeline);
         }
+        pub inline fn w(self: @This()) struct { []const u8 } {
+            return .{self.workspace};
+        }
+        pub inline fn w_(self: @This(), a: []const u8) struct { []const u8, []const u8 } {
+            return .{ self.workspace, a };
+        }
+        pub inline fn wp(self: @This()) struct { []const u8, []const u8 } {
+            return .{ self.workspace, self.pipeline };
+        }
+        pub inline fn wpd(self: @This()) struct { []const u8, []const u8, Deployment.Id } {
+            return .{ self.workspace, self.pipeline, self.deployment };
+        }
+        pub inline fn wpd_(self: @This(), a: []const u8) struct { []const u8, []const u8, Deployment.Id, []const u8 } {
+            return .{ self.workspace, self.pipeline, self.deployment, a };
+        }
+        pub inline fn w_d(self: @This(), a: []const u8) struct { []const u8, []const u8, Deployment.Id } {
+            return .{ self.workspace, a, self.deployment };
+        }
     };
 
     pub const spawn = struct {
@@ -82,64 +121,36 @@ pub const task = struct {
         pub const Res = struct {};
     };
     pub const poll = struct {
-        pub const ItemReq = struct {
-            task: Id,
-            logs_offset: ?u64,
-        };
-        pub const Req = union(enum) {
-            header: struct {
-                tasks: []const ItemReq,
-            },
-        };
+        pub const Status = ?Task.Status;
         pub const Logs = struct {
             data: []const u8,
-            compressed: bool,
             end_offset: u64,
-        };
-        pub const Status = union(enum) {
-            running,
-            success,
-            failed: u16,
-            not_found,
         };
         pub const TaskUsage = struct {
             cpu_usec: u64 = 0,
             memory_bytes: u64 = 0,
         };
-        pub const ItemRes = struct {
+        pub const Req = ?struct {
+            task: Id,
+            logs_offset: ?u64,
+        };
+        pub const Res = ?struct {
             task: Id,
             logs: ?Logs,
             status: Status,
             usage: ?TaskUsage = null,
         };
-        pub const Res = union(enum) {
-            item: ItemRes,
-            footer: struct {},
-        };
     };
     pub const kill = struct {
         pub const Req = struct {
             workspace: []const u8 = "",
-            deployment: ?Deployment.Id = null,
-            pipeline: ?[]const u8 = null,
+            deployment: Deployment.Id,
+            pipeline: []const u8,
         };
-        pub const Res = struct {
-            killed_count: u32,
-        };
+        pub const Res = struct {};
     };
 };
-pub const gc = struct {
-    pub const Req = struct {
-        workspace: ?[]const u8 = null,
-        keep: ?u32 = null,
-        older_than_ms: ?u64 = null,
-        dry_run: bool = false,
-    };
-    pub const Res = struct {
-        deployments_removed: u32,
-        bytes_freed: u64,
-    };
-};
+
 pub const system = struct {
     pub const stats = struct {
         pub const Req = struct {
@@ -153,20 +164,19 @@ pub const Request = enum(u8) {
     artifact_pull,
     artifact_has,
 
+    cache_push,
+    cache_pull,
+    cache_has,
+
     task_spawn,
     task_poll,
     task_kill,
 
     system_stats,
-    gc,
 };
 
 pub const DaemonMsg = union(enum) {
-    const TaskCompleted = struct {
-        status: u16,
-        task: task.Id,
-    };
-    task_completed: TaskCompleted,
+    reload,
 };
 
 req: Request,
@@ -177,13 +187,19 @@ pull_req: artifact.pull.Req,
 pull_res: artifact.pull.Res,
 has_req: artifact.has.Req,
 has_res: artifact.has.Res,
+cache_push_req: cache.push.Req,
+cache_push_res: cache.push.Res,
+cache_pull_req: cache.pull.Req,
+cache_pull_res: cache.pull.Res,
+cache_has_req: cache.has.Req,
+cache_has_res: cache.has.Res,
 spawn_req: task.spawn.Req,
 spawn_res: task.spawn.Res,
 poll_req: task.poll.Req,
 poll_res: task.poll.Res,
 kill_req: task.kill.Req,
 kill_res: task.kill.Res,
-gc_req: gc.Req,
-gc_res: gc.Res,
 stats_req: system.stats.Req,
+pack: Pack,
+
 pub const hash = zoto.hashType(@This());

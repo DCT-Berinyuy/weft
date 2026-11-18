@@ -4,7 +4,7 @@ const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 const epoch_ms: u64 = 1_767_225_600_000;
 
 const decode_table: [128]u8 = blk: {
-    var table: [128]u8 = [_]u8{255} ** 128;
+    var table: [128]u8 = @splat(255);
     for (alphabet, 0..) |c, idx|
         table[c] = @intCast(idx);
 
@@ -15,7 +15,7 @@ raw: u64,
 
 pub fn now(io: std.Io) !@This() {
     const wall_ms = @as(u64, @intCast(std.Io.Clock.now(.real, io).toMilliseconds()));
-    const ms_since_epoch = if (wall_ms > epoch_ms) wall_ms - epoch_ms else 0;
+    const ms_since_epoch = wall_ms -| epoch_ms;
     const ticks = ms_since_epoch / 100;
     var salt: [2]u8 = undefined;
     try io.randomSecure(&salt);

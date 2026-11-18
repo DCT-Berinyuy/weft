@@ -1,10 +1,10 @@
 const std = @import("std");
+const Ed25519 = std.crypto.sign.Ed25519;
+const X25519 = std.crypto.dh.X25519;
 
 const Deployment = @import("../client/Deployment.zig");
-const proto = @import("../domain/proto.zig");
 const zoto = @import("../util/zoto.zig");
 const Crypt = @import("Crypt.zig");
-const Nonce = @import("Nonce.zig");
 
 pub const max_packet_size = std.math.maxInt(u16);
 
@@ -18,33 +18,6 @@ writer: *std.Io.Writer,
 
 write_crypt: Crypt,
 read_crypt: Crypt,
-
-pub fn init(io: std.Io, secret: *const [32]u8, reader: *std.Io.Reader, writer: *std.Io.Writer) !@This() {
-    try writer.writeAll("weft");
-    try writer.writeInt(u64, proto.hash, .little);
-    try writer.flush();
-
-    var buff: [12]u8 = undefined;
-    try reader.readSliceAll(&buff);
-    const other_hash = std.mem.readInt(u64, buff[4..], .little);
-
-    if (!std.mem.eql(u8, buff[0..4], "weft"))
-        return error.InvalidProtocol
-    else if (other_hash != proto.hash)
-        return error.SchemaMismatch;
-
-    const out_nonce = try Nonce.random(io);
-    try out_nonce.write(writer);
-    try writer.flush();
-    const in_nonce = try Nonce.read(reader);
-
-    return .{
-        .reader = reader,
-        .writer = writer,
-        .write_crypt = .init(secret, out_nonce),
-        .read_crypt = .init(secret, in_nonce),
-    };
-}
 
 pub fn send(self: *@This(), buffer: []u8) !void {
     if (buffer.len > max_packet_size)
@@ -83,6 +56,7 @@ pub fn recv(self: *@This(), alloc: std.mem.Allocator) ![]u8 {
 
     return data;
 }
+
 pub fn recv_buf(self: *@This(), buf: []u8) ![]u8 {
     var fba: std.heap.FixedBufferAllocator = .init(buf);
     return self.recv(fba.allocator()) catch |err| {
@@ -93,10 +67,11 @@ pub fn recv_buf(self: *@This(), buf: []u8) ![]u8 {
     };
 }
 
-pub fn recv_object(self: *@This(), alloc: std.mem.Allocator, comptime T: type) !T {
-    var data: []const u8 = try self.recv(alloc);
-    return try zoto.deserialize(alloc, &data, T, ZotoOptions);
+pub fn recv_object(self: *@This(), ara: std.mem.Allocator, comptime T: type) !T {
+    var data: []const u8 = try self.recv(ara);
+    return try zoto.deserialize(ara, &data, T, ZotoOptions);
 }
+
 pub fn recv_object_buf(self: *@This(), buf: []u8, comptime T: type) !T {
     var alloc: std.heap.FixedBufferAllocator = .init(buf);
     return self.recv_object(alloc.allocator(), T) catch |err|
